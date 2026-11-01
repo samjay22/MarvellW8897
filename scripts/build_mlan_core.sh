@@ -25,10 +25,13 @@ override_root="$output_root/overrides"
 mkdir -p "$override_root"
 cp "$source_root/mlan_pcie.c" "$override_root/mlan_pcie.c"
 cp "$source_root/mlan_11n_aggr.c" "$override_root/mlan_11n_aggr.c"
+cp "$source_root/mlan_sta_rx.c" "$override_root/mlan_sta_rx.c"
+cp "$source_root/mlan_uap_txrx.c" "$override_root/mlan_uap_txrx.c"
 cp "$project_root/patches/marvell_rx_length_guard.h" "$override_root/"
 cp "$project_root/patches/marvell_amsdu_guard.h" "$override_root/"
 patch -s -F 0 -d "$override_root" -i "$project_root/patches/nxp-mlan-pcie-rx-length.patch"
 patch -s -F 0 -d "$override_root" -i "$project_root/patches/nxp-mlan-amsdu-length.patch"
+patch -s -F 0 -d "$override_root" -i "$project_root/patches/nxp-mlan-rxpd-layout.patch"
 
 sources=(
   shim init txrx cmdevt misc cfp wmm pcie
@@ -41,7 +44,7 @@ objects=()
 for name in "${sources[@]}"; do
   object="$output_root/mlan_${name}.o"
   source_file="$source_root/mlan_${name}.c"
-  if [[ "$name" == pcie || "$name" == 11n_aggr ]]; then
+  if [[ "$name" == pcie || "$name" == 11n_aggr || "$name" == sta_rx || "$name" == uap_txrx ]]; then
     source_file="$override_root/mlan_${name}.c"
   fi
   "$compiler" \

@@ -1,0 +1,56 @@
+--- mlan_sta_rx.c
++++ mlan_sta_rx.c
+@@ -36,6 +36,7 @@
+ #include "mlan_11n_aggr.h"
+ #include "mlan_11n_rxreorder.h"
+ #include "mlan_11ax.h"
++#include "marvell_rx_length_guard.h"
+ 
+ /********************************************************
+  * Local Variables
+@@ -694,6 +695,17 @@
+ 	prx_pd = (RxPD *)(pmbuf->pbuf + pmbuf->data_offset);
+ 	/* Endian conversion */
+ 	endian_convert_RxPD(prx_pd);
++	if (!marvell_valid_rxpd_layout(
++			pmbuf->data_len, Rx_PD_SIZEOF(pmadapter),
++			sizeof(rxpd_extra_info),
++			prx_pd->flags & RXPD_FLAG_EXTRA_HEADER,
++			prx_pd->rx_pkt_offset, prx_pd->rx_pkt_length)) {
++		PRINTM(MERROR, "Wrong RxPD packet layout\n");
++		pmbuf->status_code = MLAN_ERROR_PKT_SIZE_INVALID;
++		ret = MLAN_STATUS_FAILURE;
++		pmadapter->ops.data_complete(pmadapter, pmbuf, ret);
++		goto done;
++	}
+ 	if (prx_pd->flags & RXPD_FLAG_EXTRA_HEADER)
+ 		endian_convert_RxPD_extra_header(
+ 			(rxpd_extra_info *)((t_u8 *)prx_pd +
+--- mlan_uap_txrx.c
++++ mlan_uap_txrx.c
+@@ -38,6 +38,7 @@
+ #include "mlan_wmm.h"
+ #include "mlan_11n_aggr.h"
+ #include "mlan_11n_rxreorder.h"
++#include "marvell_rx_length_guard.h"
+ 
+ /********************************************************
+  * Local Functions
+@@ -334,6 +335,17 @@
+ 	prx_pd = (RxPD *)(pmbuf->pbuf + pmbuf->data_offset);
+ 	/* Endian conversion */
+ 	endian_convert_RxPD(prx_pd);
++	if (!marvell_valid_rxpd_layout(
++			pmbuf->data_len, Rx_PD_SIZEOF(pmadapter),
++			sizeof(rxpd_extra_info),
++			prx_pd->flags & RXPD_FLAG_EXTRA_HEADER,
++			prx_pd->rx_pkt_offset, prx_pd->rx_pkt_length)) {
++		PRINTM(MERROR, "Wrong RxPD packet layout\n");
++		pmbuf->status_code = MLAN_ERROR_PKT_SIZE_INVALID;
++		ret = MLAN_STATUS_FAILURE;
++		pmadapter->ops.data_complete(pmadapter, pmbuf, ret);
++		goto done;
++	}
+ 
+ 	if (prx_pd->flags & RXPD_FLAG_EXTRA_HEADER)
+ 		endian_convert_RxPD_extra_header(

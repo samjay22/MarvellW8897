@@ -2,7 +2,7 @@
 
 This repository contains an experimental x86_64 IOKit driver for the Surface Pro 4's PCIe Marvell AVASTAR 88W8897 (`11ab:2b38`), plus a macOS host adapter around NXP's GPL-2.0 MLAN protocol core. The target is macOS Sequoia via OpenCore.
 
-**Current status (31 October 2026): experimental and intermittently connected.** The physical Surface Pro 4 booted macOS Sequoia Recovery with this kext injected by OpenCore. The controller matched PCI ID `11ab:2b38`, initialized MLAN (`registered=1 initComplete=1 initStatus=0`), exposed `en0`, joined a WPA2 network, received an IPv4 address by DHCP, and exchanged packets with both a local host and the internet. The connection has also dropped during a large installer download. Recovery needs a manual join or a temporary reconnect helper after each boot. Installed macOS operation and reliable boot-time Wi-Fi are not yet verified.
+**Current status (1 November 2026): experimental and intermittently connected.** The physical Surface Pro 4 booted macOS Sequoia Recovery and then installed macOS Sequoia with this kext injected by OpenCore. The controller matched PCI ID `11ab:2b38`, initialized MLAN (`registered=1 initComplete=1 initStatus=0`), exposed an Ethernet-style `en*` interface, joined a WPA2 network, received an IPv4 address by DHCP, and exchanged packets with both a local host and the internet. A supervised manual association from the installed desktop also completed on 1 November. The connection has dropped during a large installer download and an earlier desktop kernel panic implicated the driver under traffic. Reliable boot-time Wi-Fi, reconnect, sleep/wake, sustained traffic, and native Wi-Fi integration are not verified.
 
 ## Implemented in the development build
 
