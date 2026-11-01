@@ -54,6 +54,7 @@ struct Context {
     thread_call_t scanReadCall;
     thread_call_t connectCall;
     thread_call_t connectTimeoutCall;
+    IOSimpleLock* schedulingLock;
     uint32_t shuttingDown;
     t_u32 lastEventId;
     t_u64 eventCount;
@@ -114,7 +115,29 @@ bool isShuttingDown(const Context* host)
 { return __atomic_load_n(&host->shuttingDown, __ATOMIC_ACQUIRE) != 0; }
 
 void beginShutdown(Context* host)
-{ __atomic_store_n(&host->shuttingDown, 1U, __ATOMIC_RELEASE); }
+{
+    if (host->schedulingLock) IOSimpleLockLock(host->schedulingLock);
+    __atomic_store_n(&host->shuttingDown, 1U, __ATOMIC_RELEASE);
+    if (host->schedulingLock) IOSimpleLockUnlock(host->schedulingLock);
+}
+
+// Submitting under the same lock as beginShutdown closes the race between a
+// producer checking the shutdown flag and the teardown cancelling its work.
+void scheduleCall(Context* host, thread_call_t call)
+{
+    if (!host || !host->schedulingLock || !call) return;
+    IOSimpleLockLock(host->schedulingLock);
+    if (!isShuttingDown(host)) thread_call_enter(call);
+    IOSimpleLockUnlock(host->schedulingLock);
+}
+
+void scheduleDelayedCall(Context* host, thread_call_t call, uint64_t deadline)
+{
+    if (!host || !host->schedulingLock || !call) return;
+    IOSimpleLockLock(host->schedulingLock);
+    if (!isShuttingDown(host)) thread_call_enter_delayed(call, deadline);
+    IOSimpleLockUnlock(host->schedulingLock);
+}
 
 } // namespace
 
@@ -793,7 +816,7 @@ mlan_status completionInit(t_void* value, mlan_status status)
     __atomic_store_n(&host->initStatus, static_cast<t_u32>(status), __ATOMIC_RELEASE);
     __atomic_store_n(&host->initComplete, 1U, __ATOMIC_RELEASE);
     if (status == MLAN_STATUS_SUCCESS && host->networkCall)
-        thread_call_enter(host->networkCall);
+        scheduleCall(host, host->networkCall);
     IOLog("MarvellW8897: MLAN firmware initialization status=%u\n",
           static_cast<unsigned>(status));
     return MLAN_STATUS_SUCCESS;
@@ -846,14 +869,14 @@ void networkCallFired(thread_call_param_t value, thread_call_param_t)
             if (submit) {
                 const mlan_status status = mlan_ioctl(host->adapter, &host->infoRequest);
                 if (status == MLAN_STATUS_PENDING) {
-                    thread_call_enter(host->mainCall);
+                    scheduleCall(host, host->mainCall);
                 } else {
                     IOLockLock(host->infoLock);
                     if (host->infoPhase == 1)
                         host->infoPhase = status == MLAN_STATUS_SUCCESS ? 2 : 3;
                     IOLockUnlock(host->infoLock);
                     if (status == MLAN_STATUS_SUCCESS)
-                        thread_call_enter(host->networkCall);
+                        scheduleCall(host, host->networkCall);
                     else
                         IOLog("MarvellW8897: firmware-info request failed, status=%u\n",
                               static_cast<unsigned>(status));
@@ -905,7 +928,7 @@ void scanReadCallFired(thread_call_param_t value, thread_call_param_t)
 
     const mlan_status status = mlan_ioctl(host->adapter, &host->scanReadRequest);
     if (status == MLAN_STATUS_PENDING) {
-        thread_call_enter(host->mainCall);
+        scheduleCall(host, host->mainCall);
         return;
     }
     IOLockLock(host->scanLock);
@@ -917,7 +940,7 @@ void scanReadCallFired(thread_call_param_t value, thread_call_param_t)
         host->scanResultPhase = 2;
     }
     IOLockUnlock(host->scanLock);
-    if (host->connectCall) thread_call_enter(host->connectCall);
+    if (host->connectCall) scheduleCall(host, host->connectCall);
 }
 
 // 1 scanning, 2 clear old IE, 3 auth, 4 cipher, 5 passphrase,
@@ -947,7 +970,7 @@ void connectTimeoutFired(thread_call_param_t value, thread_call_param_t)
         }
     }
     IOLockUnlock(host->connectLock);
-    if (retryOn2GHz && host->connectCall) thread_call_enter(host->connectCall);
+    if (retryOn2GHz && host->connectCall) scheduleCall(host, host->connectCall);
     if (timedOut) IOLog("MarvellW8897: association timed out\n");
 }
 
@@ -991,11 +1014,11 @@ void finishConnectStep(Context* host, mlan_status status, t_u32 expectedPhase)
     if (selectedChannel && host->controller)
         host->controller->setProperty("MarvellAssociatedChannel",
                                       selectedChannel, 16);
-    if (next && !isShuttingDown(host)) thread_call_enter(host->connectCall);
+    if (next && !isShuttingDown(host)) scheduleCall(host, host->connectCall);
     if (awaitEvent && !isShuttingDown(host) && host->connectTimeoutCall) {
         uint64_t deadline = 0;
         clock_interval_to_deadline(30000, kMillisecondScale, &deadline);
-        thread_call_enter_delayed(host->connectTimeoutCall, deadline);
+        scheduleDelayedCall(host, host->connectTimeoutCall, deadline);
     }
 }
 
@@ -1155,7 +1178,7 @@ void connectCallFired(thread_call_param_t value, thread_call_param_t)
 
     const mlan_status status = mlan_ioctl(host->adapter, &host->connectRequest);
     if (status == MLAN_STATUS_PENDING) {
-        thread_call_enter(host->mainCall);
+        scheduleCall(host, host->mainCall);
         return;
     }
     finishConnectStep(host, status, phase);
@@ -1191,22 +1214,22 @@ mlan_status completionEvent(t_void* value, pmlan_event event)
     __atomic_fetch_add(&host->eventCount, 1ULL, __ATOMIC_RELAXED);
     switch (event->event_id) {
     case MLAN_EVENT_ID_DRV_DEFER_HANDLING:
-        thread_call_enter(host->mainCall);
+        scheduleCall(host, host->mainCall);
         break;
     case MLAN_EVENT_ID_DRV_DEFER_RX_WORK:
     case MLAN_EVENT_ID_DRV_DEFER_RX_DATA:
-        thread_call_enter(host->rxCall);
+        scheduleCall(host, host->rxCall);
         break;
     case MLAN_EVENT_ID_DRV_DEFER_TX_COMPLTE:
     case MLAN_EVENT_ID_DRV_DELAY_TX_COMPLETE:
-        thread_call_enter(host->txCall);
+        scheduleCall(host, host->txCall);
         break;
     case MLAN_EVENT_ID_DRV_DEFER_CMDRESP:
-        thread_call_enter(host->commandCall);
+        scheduleCall(host, host->commandCall);
         break;
     case MLAN_EVENT_ID_DRV_CONNECTED:
         __atomic_store_n(&host->associated, 1U, __ATOMIC_RELEASE);
-        if (host->networkCall) thread_call_enter(host->networkCall);
+        if (host->networkCall) scheduleCall(host, host->networkCall);
         if (host->connectLock) {
             IOLockLock(host->connectLock);
             if (host->connectPhase >= 9 && host->connectPhase <= 12) {
@@ -1220,7 +1243,7 @@ mlan_status completionEvent(t_void* value, pmlan_event event)
         break;
     case MLAN_EVENT_ID_FW_DISCONNECTED:
         __atomic_store_n(&host->associated, 0U, __ATOMIC_RELEASE);
-        if (host->networkCall) thread_call_enter(host->networkCall);
+        if (host->networkCall) scheduleCall(host, host->networkCall);
         if (host->connectLock) {
             bool retryOn2GHz = false;
             IOLockLock(host->connectLock);
@@ -1244,7 +1267,7 @@ mlan_status completionEvent(t_void* value, pmlan_event event)
             IOLockUnlock(host->connectLock);
             if (retryOn2GHz) {
                 if (host->connectTimeoutCall) thread_call_cancel(host->connectTimeoutCall);
-                if (host->connectCall) thread_call_enter(host->connectCall);
+                if (host->connectCall) scheduleCall(host, host->connectCall);
             }
         }
         break;
@@ -1263,7 +1286,7 @@ mlan_status completionIoctl(t_void* value, pmlan_ioctl_req request, mlan_status 
             host->infoPhase = status == MLAN_STATUS_SUCCESS ? 2 : 3;
         IOLockUnlock(host->infoLock);
         if (status == MLAN_STATUS_SUCCESS && !isShuttingDown(host))
-            thread_call_enter(host->networkCall);
+            scheduleCall(host, host->networkCall);
         else if (status != MLAN_STATUS_SUCCESS)
             IOLog("MarvellW8897: firmware-info completion failed, status=%u\n",
                   static_cast<unsigned>(status));
@@ -1285,12 +1308,12 @@ mlan_status completionIoctl(t_void* value, pmlan_ioctl_req request, mlan_status 
         connectAdvanced = true;
     }
     IOLockUnlock(host->scanLock);
-    if (readResults && !isShuttingDown(host)) thread_call_enter(host->scanReadCall);
+    if (readResults && !isShuttingDown(host)) scheduleCall(host, host->scanReadCall);
     if (!readResults && request == &host->scanRequest &&
         !isShuttingDown(host) && host->connectCall)
-        thread_call_enter(host->connectCall);
+        scheduleCall(host, host->connectCall);
     if (connectAdvanced && !isShuttingDown(host) && host->connectCall)
-        thread_call_enter(host->connectCall);
+        scheduleCall(host, host->connectCall);
     if (request == &host->connectRequest)
         finishConnectStep(host, status, host->connectRequestPhase);
     return MLAN_STATUS_SUCCESS;
@@ -1354,8 +1377,14 @@ Context* registerCore(MarvellW8897Controller* controller)
     if (!host) return nullptr;
     bzero(host, sizeof(*host));
     host->controller = controller;
+    host->schedulingLock = IOSimpleLockAlloc();
+    if (!host->schedulingLock) {
+        IOFree(host, sizeof(*host));
+        return nullptr;
+    }
     if (!initializeAtomicPool(host)) {
         destroyAtomicPool(host);
+        IOSimpleLockFree(host->schedulingLock);
         IOFree(host, sizeof(*host));
         return nullptr;
     }
@@ -1369,6 +1398,7 @@ Context* registerCore(MarvellW8897Controller* controller)
     if (!host->deferredFreeLock || !host->deferredFreeCall) {
         destroyDeferredFrees(host);
         destroyAtomicPool(host);
+        IOSimpleLockFree(host->schedulingLock);
         IOFree(host, sizeof(*host));
         return nullptr;
     }
@@ -1383,6 +1413,7 @@ Context* registerCore(MarvellW8897Controller* controller)
         if (host->mappingLock) IOLockFree(host->mappingLock);
         destroyDeferredFrees(host);
         destroyAtomicPool(host);
+        IOSimpleLockFree(host->schedulingLock);
         IOFree(host, sizeof(*host));
         return nullptr;
     }
@@ -1423,6 +1454,7 @@ Context* registerCore(MarvellW8897Controller* controller)
         IOLockFree(host->mappingLock);
         destroyDeferredFrees(host);
         destroyAtomicPool(host);
+        IOSimpleLockFree(host->schedulingLock);
         IOFree(host, sizeof(*host));
         return nullptr;
     }
@@ -1536,6 +1568,8 @@ Context* registerCore(MarvellW8897Controller* controller)
         IOLockFree(host->scanLock);
         IOLockFree(host->connectLock);
         destroyDeferredFrees(host);
+        IOSimpleLockFree(host->schedulingLock);
+        host->schedulingLock = nullptr;
         if (destroyAtomicPool(host)) IOFree(host, sizeof(*host));
         return nullptr;
     }
@@ -1575,6 +1609,8 @@ void unregisterCore(Context* host)
     IOLockFree(host->scanLock);
     IOLockFree(host->connectLock);
     destroyDeferredFrees(host);
+    IOSimpleLockFree(host->schedulingLock);
+    host->schedulingLock = nullptr;
     if (destroyAtomicPool(host)) IOFree(host, sizeof(*host));
 }
 
@@ -1588,7 +1624,7 @@ unsigned startFirmware(Context* host, bool msiInterrupt)
     if (mlan_set_init_param(host->adapter, &parameters) != MLAN_STATUS_SUCCESS)
         return static_cast<unsigned>(MLAN_STATUS_FAILURE);
     const mlan_status status = mlan_init_fw(host->adapter);
-    if (status == MLAN_STATUS_PENDING) thread_call_enter(host->mainCall);
+    if (status == MLAN_STATUS_PENDING) scheduleCall(host, host->mainCall);
     else if (status == MLAN_STATUS_SUCCESS &&
              __atomic_load_n(&host->initComplete, __ATOMIC_ACQUIRE) == 0)
         // MLAN can finish synchronously; there will be no later completion
@@ -1601,7 +1637,7 @@ bool processInterrupt(Context* host)
 {
     if (!host || !host->adapter || isShuttingDown(host)) return false;
     if (mlan_interrupt(0xffff, host->adapter) == MLAN_STATUS_FAILURE) return false;
-    thread_call_enter(host->mainCall);
+    scheduleCall(host, host->mainCall);
     return true;
 }
 
@@ -1660,7 +1696,7 @@ bool sendEthernetFrame(Context* host, mbuf_t source, unsigned length)
     }
     const mlan_status status = mlan_send_packet(host->adapter, packet);
     if (status == MLAN_STATUS_PENDING) {
-        thread_call_enter(host->mainCall);
+        scheduleCall(host, host->mainCall);
         return true;
     }
     deallocate(packet);
@@ -1700,7 +1736,7 @@ unsigned requestScan(Context* host, const unsigned char* ssid, unsigned length)
 
     const mlan_status status = mlan_ioctl(host->adapter, &host->scanRequest);
     if (status == MLAN_STATUS_PENDING) {
-        thread_call_enter(host->mainCall);
+        scheduleCall(host, host->mainCall);
         return 0;
     }
     bool readResults = false;
@@ -1711,7 +1747,7 @@ unsigned requestScan(Context* host, const unsigned char* ssid, unsigned length)
         readResults = status == MLAN_STATUS_SUCCESS;
     }
     IOLockUnlock(host->scanLock);
-    if (readResults) thread_call_enter(host->scanReadCall);
+    if (readResults) scheduleCall(host, host->scanReadCall);
     return status == MLAN_STATUS_SUCCESS ? 0 : 3;
 }
 

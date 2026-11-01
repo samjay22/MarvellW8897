@@ -313,7 +313,10 @@ bool MarvellW8897Controller::start(IOService* provider)
     }
 
     registerService();
-    fAutoStartCall = thread_call_allocate(sAutoStart, this);
+    // A retry must not overlap the previous invocation; stop() can then
+    // cancel the retry and wait for an in-flight invocation before teardown.
+    fAutoStartCall = thread_call_allocate_with_options(
+        sAutoStart, this, THREAD_CALL_PRIORITY_HIGH, THREAD_CALL_OPTIONS_ONCE);
     if (fAutoStartCall) {
         uint64_t deadline = 0;
         clock_interval_to_deadline(5000, kMillisecondScale, &deadline);
@@ -612,13 +615,20 @@ void MarvellW8897Controller::sAutoStart(thread_call_param_t owner,
              result.status == MarvellW8897FirmwareProtocol::Status::HelperTimeout);
         if (retryableNoTransfer &&
             controller->fAutoStartAttempts < kMaxAutoStartAttempts &&
-            !__atomic_load_n(&controller->fStopping, __ATOMIC_ACQUIRE) &&
-            controller->fAutoStartCall) {
-            uint64_t deadline = 0;
-            clock_interval_to_deadline(kAutoRetryDelayMs, kMillisecondScale, &deadline);
-            thread_call_enter_delayed(controller->fAutoStartCall, deadline);
-            IOLog("MarvellW8897: automatic retry scheduled, attempt=%u/%u\n",
-                  controller->fAutoStartAttempts + 1, kMaxAutoStartAttempts);
+            controller->fNetworkLock) {
+            bool scheduled = false;
+            IOLockLock(controller->fNetworkLock);
+            if (!__atomic_load_n(&controller->fStopping, __ATOMIC_ACQUIRE) &&
+                controller->fAutoStartCall) {
+                uint64_t deadline = 0;
+                clock_interval_to_deadline(kAutoRetryDelayMs, kMillisecondScale, &deadline);
+                thread_call_enter_delayed(controller->fAutoStartCall, deadline);
+                scheduled = true;
+            }
+            IOLockUnlock(controller->fNetworkLock);
+            if (scheduled)
+                IOLog("MarvellW8897: automatic retry scheduled, attempt=%u/%u\n",
+                      controller->fAutoStartAttempts + 1, kMaxAutoStartAttempts);
         }
         return;
     }
