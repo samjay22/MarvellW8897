@@ -8,6 +8,7 @@
 #include <IOKit/IOLocks.h>
 #include <kern/task.h>
 #include <kern/clock.h>
+#include <kern/thread.h>
 #include <kern/thread_call.h>
 #include <mach/mach_time.h>
 #include <libkern/libkern.h>
@@ -40,6 +41,8 @@ struct Context {
     mlan_device device;
     void* adapter;
     IOLock* mappingLock;
+    IOLock* rxWorkLock;
+    thread_t rxWorker;
     DmaMapping* mappings;
     DmaMapping* mappingBuckets[256];
     DmaMapping* reusableRxMappings;
@@ -1195,11 +1198,40 @@ void mainCallFired(thread_call_param_t value, thread_call_param_t)
     auto* host = static_cast<Context*>(value);
     if (!isShuttingDown(host) && host->adapter) mlan_main_process(host->adapter);
 }
+
+bool waitForRxWorker(Context* host)
+{
+    if (!host || !host->rxWorkLock) return false;
+    IOLockLock(host->rxWorkLock);
+    // Waiting for our own callback would deadlock. MLAN's current callers
+    // are expected to request the barrier from outside its RX worker; that
+    // assumption still needs end-to-end validation against every call path.
+    if (host->rxWorker == current_thread()) {
+        IOLockUnlock(host->rxWorkLock);
+        return false;
+    }
+    while (host->rxWorker)
+        IOLockSleep(host->rxWorkLock, &host->rxWorker, THREAD_UNINT);
+    IOLockUnlock(host->rxWorkLock);
+    return true;
+}
+
 void rxCallFired(thread_call_param_t value, thread_call_param_t)
 {
     auto* host = static_cast<Context*>(value);
-    if (!isShuttingDown(host) && host->adapter)
-        mlan_process_pcie_interrupt_cb(host->adapter, RX_DATA);
+    if (!host || !host->rxWorkLock) return;
+    IOLockLock(host->rxWorkLock);
+    if (isShuttingDown(host) || !host->adapter) {
+        IOLockUnlock(host->rxWorkLock);
+        return;
+    }
+    host->rxWorker = current_thread();
+    IOLockUnlock(host->rxWorkLock);
+    mlan_process_pcie_interrupt_cb(host->adapter, RX_DATA);
+    IOLockLock(host->rxWorkLock);
+    host->rxWorker = nullptr;
+    IOLockWakeup(host->rxWorkLock, &host->rxWorker, false);
+    IOLockUnlock(host->rxWorkLock);
 }
 void txCallFired(thread_call_param_t value, thread_call_param_t)
 {
@@ -1220,6 +1252,12 @@ mlan_status completionEvent(t_void* value, pmlan_event event)
     __atomic_store_n(&host->lastEventId, static_cast<t_u32>(event->event_id), __ATOMIC_RELAXED);
     __atomic_fetch_add(&host->eventCount, 1ULL, __ATOMIC_RELAXED);
     switch (event->event_id) {
+    case MLAN_EVENT_ID_DRV_FLUSH_RX_WORK:
+        // MLAN has already set rx_lock_flag before requesting this barrier,
+        // so later RX workers must not enter its reorder-table processing.
+        // NXP currently ignores failure from this notification: do not treat
+        // the self-thread escape as a proof that reentrant cleanup is safe.
+        return waitForRxWorker(host) ? MLAN_STATUS_SUCCESS : MLAN_STATUS_FAILURE;
     case MLAN_EVENT_ID_DRV_DEFER_HANDLING:
         scheduleCall(host, host->mainCall);
         break;
@@ -1410,13 +1448,16 @@ Context* registerCore(MarvellW8897Controller* controller)
         return nullptr;
     }
     host->mappingLock = IOLockAlloc();
+    host->rxWorkLock = IOLockAlloc();
     host->infoLock = IOLockAlloc();
     host->scanLock = IOLockAlloc();
     host->connectLock = IOLockAlloc();
-    if (!host->mappingLock || !host->infoLock || !host->scanLock || !host->connectLock) {
+    if (!host->mappingLock || !host->rxWorkLock || !host->infoLock ||
+        !host->scanLock || !host->connectLock) {
         if (host->connectLock) IOLockFree(host->connectLock);
         if (host->scanLock) IOLockFree(host->scanLock);
         if (host->infoLock) IOLockFree(host->infoLock);
+        if (host->rxWorkLock) IOLockFree(host->rxWorkLock);
         if (host->mappingLock) IOLockFree(host->mappingLock);
         destroyDeferredFrees(host);
         destroyAtomicPool(host);
@@ -1458,6 +1499,7 @@ Context* registerCore(MarvellW8897Controller* controller)
         IOLockFree(host->connectLock);
         IOLockFree(host->scanLock);
         IOLockFree(host->infoLock);
+        IOLockFree(host->rxWorkLock);
         IOLockFree(host->mappingLock);
         destroyDeferredFrees(host);
         destroyAtomicPool(host);
@@ -1571,6 +1613,7 @@ Context* registerCore(MarvellW8897Controller* controller)
         }
         releaseCachedRxMappings(host);
         IOLockFree(host->mappingLock);
+        IOLockFree(host->rxWorkLock);
         IOLockFree(host->infoLock);
         IOLockFree(host->scanLock);
         IOLockFree(host->connectLock);
@@ -1612,6 +1655,7 @@ void unregisterCore(Context* host)
     }
     releaseCachedRxMappings(host);
     IOLockFree(host->mappingLock);
+    IOLockFree(host->rxWorkLock);
     IOLockFree(host->infoLock);
     IOLockFree(host->scanLock);
     IOLockFree(host->connectLock);

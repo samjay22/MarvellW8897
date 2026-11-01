@@ -1,0 +1,29 @@
+--- mlan_pcie.c
++++ mlan_pcie.c
+@@ -38,6 +38,7 @@
+ #include "mlan_wmm.h"
+ #include "mlan_11n.h"
+ #include "mlan_pcie.h"
++#include "marvell_rx_length_guard.h"
+ 
+ /********************************************************
+  * Local Variables
+@@ -3357,7 +3358,9 @@
+ 		       pmadapter->pcard_pcie->rxbd_wrptr, rdptr, rx_len,
+ 		       rx_type);
+ 
+-		if (rx_len && rx_len <= pmadapter->rx_buf_size) {
++		if (marvell_valid_pcie_rx_length(
++			    rx_len, pmadapter->rx_buf_size,
++			    PCIE_INTF_HEADER_LEN, Rx_PD_SIZEOF(pmadapter))) {
+ 			pmadapter->pcard_pcie->rx_buf_list[rd_index] = MNULL;
+ 			/* send buffer to host (which will free it) */
+ 			pmbuf->data_len = rx_len - PCIE_INTF_HEADER_LEN;
+@@ -3410,6 +3413,7 @@
+ 			 */
+ 			PRINTM(MERROR, "PCIE: Drop invalid packet, length=%d",
+ 			       rx_len);
++			pmadapter->pcard_pcie->rx_buf_list[rd_index] = MNULL;
+ 			wlan_free_mlan_buffer(pmadapter, pmbuf);
+ 			pmbuf = MNULL;
+ 		}

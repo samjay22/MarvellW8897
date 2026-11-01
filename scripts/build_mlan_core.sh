@@ -18,6 +18,15 @@ archiver="$developer_dir/Toolchains/XcodeDefault.xctoolchain/usr/bin/libtool"
 
 mkdir -p "$output_root"
 
+# Build against the pinned NXP source, applying our reviewed PCIe RX length
+# guard to a copy.  Do not modify the submodule checkout.  Refuse fuzzy patch
+# matches so an upstream change cannot silently bypass or misplace the guard.
+override_root="$output_root/overrides"
+mkdir -p "$override_root"
+cp "$source_root/mlan_pcie.c" "$override_root/mlan_pcie.c"
+cp "$project_root/patches/marvell_rx_length_guard.h" "$override_root/"
+patch -s -F 0 -d "$override_root" -i "$project_root/patches/nxp-mlan-pcie-rx-length.patch"
+
 sources=(
   shim init txrx cmdevt misc cfp wmm pcie
   11n_aggr 11n_rxreorder 11n 11ac 11ax 11d 11h
@@ -28,6 +37,10 @@ sources=(
 objects=()
 for name in "${sources[@]}"; do
   object="$output_root/mlan_${name}.o"
+  source_file="$source_root/mlan_${name}.c"
+  if [[ "$name" == pcie ]]; then
+    source_file="$override_root/mlan_pcie.c"
+  fi
   "$compiler" \
     -target x86_64-apple-macos15.4 \
     -isysroot "$sdk" \
@@ -36,7 +49,7 @@ for name in "${sources[@]}"; do
     -DKERNEL -DMLAN_64BIT -DPCIE -DPCIE8897 -DSTA_SUPPORT -DUAP_SUPPORT \
     -DDEBUG_LEVEL1 '-Dfallthrough=__attribute__((fallthrough))' \
     -I "$source_root" \
-    -c "$source_root/mlan_${name}.c" -o "$object"
+    -c "$source_file" -o "$object"
   objects+=("$object")
 done
 
