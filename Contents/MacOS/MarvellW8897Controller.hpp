@@ -50,6 +50,7 @@ private:
     bool                       fLinkAssociated { false };
     uint64_t                   fTxLockDrops { 0 };
     uint64_t                   fRxLockDrops { 0 };
+    uint32_t                   fRxInFlight { 0 };
 
     void releaseMappedBars();
 

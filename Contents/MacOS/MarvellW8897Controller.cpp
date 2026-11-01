@@ -18,6 +18,7 @@
 #include <IOKit/network/IOOutputQueue.h>
 #include <kern/task.h>
 #include <kern/clock.h>
+#include <kern/kern_types.h>
 #include <sys/kpi_mbuf.h>
 #include <libkern/crypto/sha2.h>
 
@@ -335,6 +336,8 @@ void MarvellW8897Controller::stop(IOService* provider)
         __atomic_store_n(&fStopping, true, __ATOMIC_RELEASE);
         __atomic_store_n(&fNetworkEnabled, false, __ATOMIC_RELEASE);
         fLinkAssociated = false;
+        while (fRxInFlight != 0)
+            IOLockSleep(fNetworkLock, &fRxInFlight, THREAD_UNINT);
         interface = __atomic_exchange_n(&fNetworkInterface, nullptr,
                                         __ATOMIC_ACQ_REL);
         IOLockUnlock(fNetworkLock);
@@ -908,32 +911,38 @@ UInt32 MarvellW8897Controller::outputPacket(mbuf_t packet, void*)
 bool MarvellW8897Controller::receiveEthernetFrame(const uint8_t* bytes, uint32_t length)
 {
     if (!bytes || length < 14 || length > 4096 || !fNetworkLock) return false;
-    if (!IOLockTryLock(fNetworkLock)) {
-        __atomic_fetch_add(&fRxLockDrops, 1ULL, __ATOMIC_RELAXED);
+    // RX callbacks are drained by unregisterCore before the lock is freed.
+    // Allocate and copy before taking the shared TX/link-state lock.
+    mbuf_t packet = allocatePacket(length);
+    if (!packet) return false;
+    if (mbuf_copyback(packet, 0, length, bytes, MBUF_DONTWAIT) != 0) {
+        freePacket(packet);
         return false;
     }
-    bool delivered = false;
-    IOEthernetInterface* queuedInterface = nullptr;
+    if (!IOLockTryLock(fNetworkLock)) {
+        __atomic_fetch_add(&fRxLockDrops, 1ULL, __ATOMIC_RELAXED);
+        freePacket(packet);
+        return false;
+    }
+    IOEthernetInterface* interface = nullptr;
     if (!__atomic_load_n(&fStopping, __ATOMIC_ACQUIRE) &&
         __atomic_load_n(&fNetworkEnabled, __ATOMIC_ACQUIRE) &&
         fLinkAssociated && fNetworkInterface) {
-        mbuf_t packet = allocatePacket(length);
-        if (packet) {
-            if (mbuf_copyback(packet, 0, length, bytes, MBUF_DONTWAIT) == 0) {
-                queuedInterface = fNetworkInterface;
-                queuedInterface->retain();
-                fNetworkInterface->inputPacket(
-                    packet, length, IONetworkInterface::kInputOptionQueuePacket);
-                delivered = true;
-            } else {
-                freePacket(packet);
-            }
-        }
+        interface = fNetworkInterface;
+        interface->retain();
+        ++fRxInFlight;
     }
     IOLockUnlock(fNetworkLock);
-    if (queuedInterface) {
-        queuedInterface->flushInputQueue();
-        queuedInterface->release();
+    if (!interface) {
+        freePacket(packet);
+        return false;
     }
-    return delivered;
+    // Direct handoff avoids sharing the interface's unprotected input queue.
+    // stop() waits for this handoff before detaching the interface.
+    interface->inputPacket(packet, length, 0);
+    IOLockLock(fNetworkLock);
+    if (--fRxInFlight == 0) IOLockWakeup(fNetworkLock, &fRxInFlight, false);
+    IOLockUnlock(fNetworkLock);
+    interface->release();
+    return true;
 }
