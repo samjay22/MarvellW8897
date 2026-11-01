@@ -100,18 +100,28 @@ bool findInterface(io_registry_entry_t entry, std::string& name, unsigned depth)
     io_registry_entry_t child = IO_OBJECT_NULL;
     while (!found && (child = IOIteratorNext(children)) != IO_OBJECT_NULL) {
         if (IOObjectConformsTo(child, "IONetworkInterface")) {
-            CFTypeRef property = IORegistryEntryCreateCFProperty(
-                child, CFSTR("IOBSDName"), kCFAllocatorDefault, 0);
-            if (property) {
-                if (CFGetTypeID(property) == CFStringGetTypeID()) {
-                    char device[32] = {};
-                    if (CFStringGetCString(static_cast<CFStringRef>(property), device,
-                                           sizeof(device), kCFStringEncodingUTF8)) {
-                        name = device;
-                        found = true;
+            /* The kernel registry publishes the BSD interface name as
+             * "BSD Name".  Keep IOBSDName as a compatibility fallback for
+             * older registry producers. */
+            const CFStringRef propertyNames[] = {
+                CFSTR("BSD Name"),
+                CFSTR("IOBSDName"),
+            };
+            for (const CFStringRef propertyName : propertyNames) {
+                CFTypeRef property = IORegistryEntryCreateCFProperty(
+                    child, propertyName, kCFAllocatorDefault, 0);
+                if (property) {
+                    if (CFGetTypeID(property) == CFStringGetTypeID()) {
+                        char device[32] = {};
+                        if (CFStringGetCString(static_cast<CFStringRef>(property), device,
+                                               sizeof(device), kCFStringEncodingUTF8)) {
+                            name = device;
+                            found = true;
+                        }
                     }
+                    CFRelease(property);
                 }
-                CFRelease(property);
+                if (found) break;
             }
         }
         if (!found) found = findInterface(child, name, depth - 1);
