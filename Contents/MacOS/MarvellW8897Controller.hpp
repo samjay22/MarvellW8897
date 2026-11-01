@@ -48,6 +48,8 @@ private:
     bool                       fMacValid { false };
     bool                       fNetworkEnabled { false };
     bool                       fLinkAssociated { false };
+    uint64_t                   fTxLockDrops { 0 };
+    uint64_t                   fRxLockDrops { 0 };
 
     void releaseMappedBars();
 

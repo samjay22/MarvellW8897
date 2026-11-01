@@ -75,6 +75,8 @@ struct Context {
     t_u32 connectPending;
     t_u32 connectRequestPhase;
     t_u32 connectStatus;
+    bool connectPrefer5Attempted;
+    bool connectPrefer5Disabled;
 };
 
 struct DmaMapping {
@@ -698,16 +700,26 @@ void connectTimeoutFired(thread_call_param_t value, thread_call_param_t)
     auto* host = static_cast<Context*>(value);
     if (!host || isShuttingDown(host) || !host->connectLock) return;
     bool timedOut = false;
+    bool retryOn2GHz = false;
     IOLockLock(host->connectLock);
     if (host->connectPhase == 10 &&
         __atomic_load_n(&host->associated, __ATOMIC_ACQUIRE) == 0) {
-        host->connectPhase = 12;
-        host->connectStatus = MLAN_STATUS_FAILURE;
         host->connectPending = 0;
-        bzero(host->connectPassphrase, sizeof(host->connectPassphrase));
-        timedOut = true;
+        if (host->connectPrefer5Attempted && !host->connectPrefer5Disabled) {
+            host->connectPrefer5Disabled = true;
+            host->connectPrefer5Attempted = false;
+            host->connectPhase = 8;
+            host->connectStatus = MLAN_STATUS_PENDING;
+            retryOn2GHz = true;
+        } else {
+            host->connectPhase = 12;
+            host->connectStatus = MLAN_STATUS_FAILURE;
+            bzero(host->connectPassphrase, sizeof(host->connectPassphrase));
+            timedOut = true;
+        }
     }
     IOLockUnlock(host->connectLock);
+    if (retryOn2GHz && host->connectCall) thread_call_enter(host->connectCall);
     if (timedOut) IOLog("MarvellW8897: association timed out\n");
 }
 
@@ -734,6 +746,14 @@ void finishConnectStep(Context* host, mlan_status status, t_u32 expectedPhase)
             host->connectPhase = oldPhase == 9 ? 10 : oldPhase + 1;
             next = oldPhase != 9;
             awaitEvent = oldPhase == 9;
+        } else if ((oldPhase == 8 || oldPhase == 9) &&
+                   host->connectPrefer5Attempted &&
+                   !host->connectPrefer5Disabled) {
+            host->connectPrefer5Disabled = true;
+            host->connectPrefer5Attempted = false;
+            host->connectPhase = 8;
+            host->connectStatus = MLAN_STATUS_PENDING;
+            next = true;
         } else {
             host->connectPhase = 12;
             bzero(host->connectPassphrase, sizeof(host->connectPassphrase));
@@ -785,6 +805,42 @@ void connectCallFired(thread_call_param_t value, thread_call_param_t)
 
     const t_u32 phase = host->connectPhase;
     mlan_ssid_bssid foundBss {};
+    t_u8 preferredBssid[MLAN_MAC_ADDR_LENGTH] = {};
+    t_u16 preferredChannel = 0;
+    t_u32 fiveGHzCount = 0;
+    if (phase == 8 && host->scanLock) {
+        IOLockLock(host->scanLock);
+        const auto& response = host->scanReadData.param.scan_resp;
+        // NXP allocates MRVDRV_MAX_BSSID_LIST (200) scan descriptors.
+        constexpr t_u32 kMaxScanEntries = 200;
+        if (host->scanResultPhase == 2 &&
+            host->scanStatus == MLAN_STATUS_SUCCESS &&
+            response.pscan_table && host->scanCount <= kMaxScanEntries) {
+            const auto* entries = reinterpret_cast<const BSSDescriptor_t*>(
+                response.pscan_table);
+            t_u8 bestSignal = 0;
+            for (t_u32 i = 0; i < host->scanCount; ++i) {
+                const auto& entry = entries[i];
+                if (entry.channel == 0 || entry.channel > 196 ||
+                    entry.ssid.ssid_len != host->connectSsidLength ||
+                    memcmp(entry.ssid.ssid, host->connectSsid,
+                           host->connectSsidLength) != 0)
+                    continue;
+                if (entry.channel > 14) ++fiveGHzCount;
+                const bool wantedBand = host->connectPrefer5Disabled
+                    ? entry.channel <= 14 : entry.channel > 14;
+                if (!wantedBand) continue;
+                const t_u8 signal = SCAN_RSSI(entry.rssi);
+                if (!preferredChannel || signal > bestSignal) {
+                    bestSignal = signal;
+                    preferredChannel = static_cast<t_u16>(entry.channel);
+                    bcopy(entry.mac_address, preferredBssid,
+                          sizeof(preferredBssid));
+                }
+            }
+        }
+        IOLockUnlock(host->scanLock);
+    }
     if (phase == 9)
         foundBss = host->connectBss.param.ssid_bssid;
     bzero(&host->connectRequest, sizeof(host->connectRequest));
@@ -849,11 +905,21 @@ void connectCallFired(thread_call_param_t value, thread_call_param_t)
         } else {
             bss.ssid.ssid_len = host->connectSsidLength;
             bcopy(host->connectSsid, bss.ssid.ssid, host->connectSsidLength);
+            if (phase == 8 && preferredChannel) {
+                bcopy(preferredBssid, bss.bssid, sizeof(preferredBssid));
+                host->connectPrefer5Attempted = !host->connectPrefer5Disabled;
+            }
         }
     }
     host->connectPending = 1;
     host->connectRequestPhase = phase;
+    const t_u16 publishedPreferredChannel = preferredChannel;
     IOLockUnlock(host->connectLock);
+    if (phase == 8 && host->controller) {
+        host->controller->setProperty("MarvellScan5GHzCount", fiveGHzCount, 32);
+        host->controller->setProperty("MarvellPreferredChannel",
+                                      publishedPreferredChannel, 16);
+    }
 
     const mlan_status status = mlan_ioctl(host->adapter, &host->connectRequest);
     if (status == MLAN_STATUS_PENDING) {
@@ -924,14 +990,30 @@ mlan_status completionEvent(t_void* value, pmlan_event event)
         __atomic_store_n(&host->associated, 0U, __ATOMIC_RELEASE);
         if (host->networkCall) thread_call_enter(host->networkCall);
         if (host->connectLock) {
+            bool retryOn2GHz = false;
             IOLockLock(host->connectLock);
             if (host->connectPhase >= 9 && host->connectPhase <= 11) {
-                host->connectPhase = 12;
-                host->connectStatus = MLAN_STATUS_FAILURE;
                 host->connectPending = 0;
-                bzero(host->connectPassphrase, sizeof(host->connectPassphrase));
+                if (host->connectPhase == 10 &&
+                    host->connectPrefer5Attempted &&
+                    !host->connectPrefer5Disabled) {
+                    host->connectPrefer5Disabled = true;
+                    host->connectPrefer5Attempted = false;
+                    host->connectPhase = 8;
+                    host->connectStatus = MLAN_STATUS_PENDING;
+                    retryOn2GHz = true;
+                } else {
+                    host->connectPhase = 12;
+                    host->connectStatus = MLAN_STATUS_FAILURE;
+                    bzero(host->connectPassphrase,
+                          sizeof(host->connectPassphrase));
+                }
             }
             IOLockUnlock(host->connectLock);
+            if (retryOn2GHz) {
+                if (host->connectTimeoutCall) thread_call_cancel(host->connectTimeoutCall);
+                if (host->connectCall) thread_call_enter(host->connectCall);
+            }
         }
         break;
     default:
@@ -1263,9 +1345,9 @@ bool getStatus(Context* host, unsigned long long out[6])
     return true;
 }
 
-bool sendEthernetFrame(Context* host, const unsigned char* bytes, unsigned length)
+bool sendEthernetFrame(Context* host, mbuf_t source, unsigned length)
 {
-    if (!host || !host->adapter || !bytes || length < 14 || length > 1514 ||
+    if (!host || !host->adapter || !source || length < 14 || length > 1514 ||
         isShuttingDown(host) ||
         __atomic_load_n(&host->initComplete, __ATOMIC_ACQUIRE) == 0 ||
         __atomic_load_n(&host->initStatus, __ATOMIC_ACQUIRE) != MLAN_STATUS_SUCCESS ||
@@ -1285,7 +1367,10 @@ bool sendEthernetFrame(Context* host, const unsigned char* bytes, unsigned lengt
     packet->buf_type = MLAN_BUF_TYPE_DATA;
     packet->bss_index = 0;
     packet->pdesc = host;
-    bcopy(bytes, packet->pbuf + packet->data_offset, length);
+    if (mbuf_copydata(source, 0, length, packet->pbuf + packet->data_offset) != 0) {
+        deallocate(packet);
+        return false;
+    }
     const mlan_status status = mlan_send_packet(host->adapter, packet);
     if (status == MLAN_STATUS_PENDING) {
         thread_call_enter(host->mainCall);
@@ -1384,6 +1469,8 @@ unsigned requestConnect(Context* host, const unsigned char* ssid, unsigned ssidL
     host->connectStatus = MLAN_STATUS_PENDING;
     host->connectPhase = 1;
     host->connectPending = 0;
+    host->connectPrefer5Attempted = false;
+    host->connectPrefer5Disabled = false;
     IOLockUnlock(host->connectLock);
 
     const unsigned scan = requestScan(host, ssid, ssidLength);

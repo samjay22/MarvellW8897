@@ -705,6 +705,8 @@ IOReturn MarvellW8897Controller::startMlanFirmware()
 bool MarvellW8897Controller::getMlanCoreStatus(uint64_t out[6])
 {
     if (!out || !fFirmwareLock) return false;
+    setProperty("MarvellTxLockDrops", __atomic_load_n(&fTxLockDrops, __ATOMIC_RELAXED), 64);
+    setProperty("MarvellRxLockDrops", __atomic_load_n(&fRxLockDrops, __ATOMIC_RELAXED), 64);
     IOLockLock(fFirmwareLock);
     if (!fMlanContext) {
         bzero(out, 6 * sizeof(uint64_t));
@@ -882,8 +884,12 @@ UInt32 MarvellW8897Controller::outputPacket(mbuf_t packet, void*)
 {
     if (!packet) return kIOReturnOutputDropped;
     const size_t length = mbuf_pkthdr_len(packet);
-    if (length < 14 || length > 1514 || !fNetworkLock ||
-        !IOLockTryLock(fNetworkLock)) {
+    if (length < 14 || length > 1514 || !fNetworkLock) {
+        freePacket(packet);
+        return kIOReturnOutputDropped;
+    }
+    if (!IOLockTryLock(fNetworkLock)) {
+        __atomic_fetch_add(&fTxLockDrops, 1ULL, __ATOMIC_RELAXED);
         freePacket(packet);
         return kIOReturnOutputDropped;
     }
@@ -891,13 +897,8 @@ UInt32 MarvellW8897Controller::outputPacket(mbuf_t packet, void*)
     if (!__atomic_load_n(&fStopping, __ATOMIC_ACQUIRE) &&
         __atomic_load_n(&fNetworkEnabled, __ATOMIC_ACQUIRE) &&
         fLinkAssociated && fMlanContext) {
-        auto* bytes = static_cast<uint8_t*>(IOMalloc(length));
-        if (bytes) {
-            if (mbuf_copydata(packet, 0, length, bytes) == 0)
-                sent = MarvellW8897MlanHost::sendEthernetFrame(
-                    fMlanContext, bytes, static_cast<unsigned>(length));
-            IOFree(bytes, length);
-        }
+        sent = MarvellW8897MlanHost::sendEthernetFrame(
+            fMlanContext, packet, static_cast<unsigned>(length));
     }
     IOLockUnlock(fNetworkLock);
     freePacket(packet);
@@ -906,8 +907,11 @@ UInt32 MarvellW8897Controller::outputPacket(mbuf_t packet, void*)
 
 bool MarvellW8897Controller::receiveEthernetFrame(const uint8_t* bytes, uint32_t length)
 {
-    if (!bytes || length < 14 || length > 4096 || !fNetworkLock ||
-        !IOLockTryLock(fNetworkLock)) return false;
+    if (!bytes || length < 14 || length > 4096 || !fNetworkLock) return false;
+    if (!IOLockTryLock(fNetworkLock)) {
+        __atomic_fetch_add(&fRxLockDrops, 1ULL, __ATOMIC_RELAXED);
+        return false;
+    }
     bool delivered = false;
     IOEthernetInterface* queuedInterface = nullptr;
     if (!__atomic_load_n(&fStopping, __ATOMIC_ACQUIRE) &&
