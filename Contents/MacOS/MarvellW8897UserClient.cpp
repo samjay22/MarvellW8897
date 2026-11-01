@@ -231,6 +231,8 @@ IOReturn MarvellW8897UserClient::sReadReg32FromBar(MarvellW8897UserClient* targe
                                                    void*,
                                                    IOExternalMethodArguments* args)
 {
+    if (clientHasPrivilege(target->fTask, kIOClientPrivilegeAdministrator) != kIOReturnSuccess)
+        return kIOReturnNotPrivileged;
     const uint32_t barIndex = static_cast<uint32_t>(args->scalarInput[0]);
     const uint32_t offset = static_cast<uint32_t>(args->scalarInput[1]);
 
@@ -248,6 +250,8 @@ IOReturn MarvellW8897UserClient::sWriteReg32ToBar(MarvellW8897UserClient* target
                                                   void*,
                                                   IOExternalMethodArguments* args)
 {
+    if (clientHasPrivilege(target->fTask, kIOClientPrivilegeAdministrator) != kIOReturnSuccess)
+        return kIOReturnNotPrivileged;
     const uint32_t barIndex = static_cast<uint32_t>(args->scalarInput[0]);
     const uint32_t offset = static_cast<uint32_t>(args->scalarInput[1]);
     const uint32_t value  = static_cast<uint32_t>(args->scalarInput[2]);
@@ -279,6 +283,8 @@ IOReturn MarvellW8897UserClient::sWriteReg32ToBarWithFlush(MarvellW8897UserClien
                                                            void*,
                                                            IOExternalMethodArguments* args)
 {
+    if (clientHasPrivilege(target->fTask, kIOClientPrivilegeAdministrator) != kIOReturnSuccess)
+        return kIOReturnNotPrivileged;
     const uint32_t barIndex = static_cast<uint32_t>(args->scalarInput[0]);
     const uint32_t offset = static_cast<uint32_t>(args->scalarInput[1]);
     const uint32_t value  = static_cast<uint32_t>(args->scalarInput[2]);

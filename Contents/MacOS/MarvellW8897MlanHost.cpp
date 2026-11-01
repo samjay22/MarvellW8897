@@ -34,6 +34,9 @@ struct Context {
     t_u32 atomicPoolCount;
     t_u32 atomicPoolAvailable;
     t_u64 atomicPoolFailures;
+    IOSimpleLock* deferredFreeLock;
+    Allocation* deferredFree;
+    thread_call_t deferredFreeCall;
     mlan_device device;
     void* adapter;
     IOLock* mappingLock;
@@ -224,6 +227,56 @@ void deallocate(void* data)
     IOFree(header, total);
 }
 
+// MLAN may complete or discard packets while it holds a spinlock, including
+// during ordinary station disconnect. Queue heap-backed frees for a worker;
+// atomic-pool entries can be returned immediately without sleeping.
+void deferDeallocate(Context* host, void* data)
+{
+    if (!data) return;
+    auto* header = static_cast<Allocation*>(data) - 1;
+    if (header->magic != kAllocationMagic) return;
+    if (header->poolOwner) {
+        deallocate(data);
+        return;
+    }
+    if (!host || !host->deferredFreeLock || !host->deferredFreeCall) return;
+    header->magic = 0;
+    IOSimpleLockLock(host->deferredFreeLock);
+    header->next = host->deferredFree;
+    host->deferredFree = header;
+    IOSimpleLockUnlock(host->deferredFreeLock);
+    thread_call_enter(host->deferredFreeCall);
+}
+
+void drainDeferredFrees(Context* host)
+{
+    IOSimpleLockLock(host->deferredFreeLock);
+    Allocation* list = host->deferredFree;
+    host->deferredFree = nullptr;
+    IOSimpleLockUnlock(host->deferredFreeLock);
+    while (list) {
+        Allocation* next = list->next;
+        IOFree(list, list->total);
+        list = next;
+    }
+}
+
+void deferredFreeCallFired(thread_call_param_t value, thread_call_param_t)
+{
+    drainDeferredFrees(static_cast<Context*>(value));
+}
+
+void destroyDeferredFrees(Context* host)
+{
+    if (host->deferredFreeCall) {
+        thread_call_cancel_wait(host->deferredFreeCall);
+        drainDeferredFrees(host);
+        thread_call_free(host->deferredFreeCall);
+        host->deferredFreeCall = nullptr;
+    }
+    if (host->deferredFreeLock) IOSimpleLockFree(host->deferredFreeLock);
+}
+
 bool packetDataWithinAllocation(const mlan_buffer* packet)
 {
     // All MLAN packet buffers supplied by this host use allocate(), whether
@@ -253,9 +306,9 @@ mlan_status mallocCallback(t_void* value, t_u32 size, t_u32 flags, t_u8** out)
     return *out ? MLAN_STATUS_SUCCESS : MLAN_STATUS_FAILURE;
 }
 
-mlan_status freeCallback(t_void*, t_u8* data)
+mlan_status freeCallback(t_void* value, t_u8* data)
 {
-    deallocate(data);
+    deferDeallocate(static_cast<Context*>(value), data);
     return MLAN_STATUS_SUCCESS;
 }
 
@@ -470,9 +523,9 @@ mlan_status allocBufferCallback(t_void*, t_u32 size, ppmlan_buffer out)
     return MLAN_STATUS_SUCCESS;
 }
 
-mlan_status freeBufferCallback(t_void*, pmlan_buffer buffer)
+mlan_status freeBufferCallback(t_void* value, pmlan_buffer buffer)
 {
-    deallocate(buffer);
+    deferDeallocate(static_cast<Context*>(value), buffer);
     return MLAN_STATUS_SUCCESS;
 }
 
@@ -723,7 +776,7 @@ mlan_status completionPacket(t_void* value, pmlan_buffer packet, mlan_status)
 {
     auto* host = static_cast<Context*>(value);
     if (!host || !packet || packet->pdesc != host) return MLAN_STATUS_FAILURE;
-    deallocate(packet);
+    deferDeallocate(host, packet);
     return MLAN_STATUS_SUCCESS;
 }
 mlan_status completionReceive(t_void*, pmlan_buffer, t_u32, mlan_status)
@@ -1279,6 +1332,19 @@ Context* registerCore(MarvellW8897Controller* controller)
         IOFree(host, sizeof(*host));
         return nullptr;
     }
+    host->deferredFreeLock = IOSimpleLockAlloc();
+    if (host->deferredFreeLock)
+        // ONCE serializes re-submissions and lets cancel_wait wait for the
+        // active call even when another invocation was pending at shutdown.
+        host->deferredFreeCall = thread_call_allocate_with_options(
+            deferredFreeCallFired, host, THREAD_CALL_PRIORITY_HIGH,
+            THREAD_CALL_OPTIONS_ONCE);
+    if (!host->deferredFreeLock || !host->deferredFreeCall) {
+        destroyDeferredFrees(host);
+        destroyAtomicPool(host);
+        IOFree(host, sizeof(*host));
+        return nullptr;
+    }
     host->mappingLock = IOLockAlloc();
     host->infoLock = IOLockAlloc();
     host->scanLock = IOLockAlloc();
@@ -1288,6 +1354,7 @@ Context* registerCore(MarvellW8897Controller* controller)
         if (host->scanLock) IOLockFree(host->scanLock);
         if (host->infoLock) IOLockFree(host->infoLock);
         if (host->mappingLock) IOLockFree(host->mappingLock);
+        destroyDeferredFrees(host);
         destroyAtomicPool(host);
         IOFree(host, sizeof(*host));
         return nullptr;
@@ -1316,6 +1383,7 @@ Context* registerCore(MarvellW8897Controller* controller)
         IOLockFree(host->scanLock);
         IOLockFree(host->infoLock);
         IOLockFree(host->mappingLock);
+        destroyDeferredFrees(host);
         destroyAtomicPool(host);
         IOFree(host, sizeof(*host));
         return nullptr;
@@ -1429,6 +1497,7 @@ Context* registerCore(MarvellW8897Controller* controller)
         IOLockFree(host->infoLock);
         IOLockFree(host->scanLock);
         IOLockFree(host->connectLock);
+        destroyDeferredFrees(host);
         if (destroyAtomicPool(host)) IOFree(host, sizeof(*host));
         return nullptr;
     }
@@ -1467,6 +1536,7 @@ void unregisterCore(Context* host)
     IOLockFree(host->infoLock);
     IOLockFree(host->scanLock);
     IOLockFree(host->connectLock);
+    destroyDeferredFrees(host);
     if (destroyAtomicPool(host)) IOFree(host, sizeof(*host));
 }
 
