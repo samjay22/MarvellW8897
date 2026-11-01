@@ -1,0 +1,73 @@
+--- mlan_11n_aggr.c
++++ mlan_11n_aggr.c
+@@ -35,6 +35,7 @@
+ #include "mlan_wmm.h"
+ #include "mlan_11n.h"
+ #include "mlan_11n_aggr.h"
++#include "marvell_amsdu_guard.h"
+ 
+ /********************************************************
+  * Local Variables
+@@ -378,6 +379,7 @@
+ 				     int total_pkt_len, t_u8 *forward)
+ {
+ 	int pkt_count = 0, pkt_len, pad;
++	unsigned int checked_pad;
+ 	t_u8 hdr_len = sizeof(Eth803Hdr_t);
+ 
+ 	t_u8 forward_flag = MFALSE;
+@@ -395,14 +397,13 @@
+ 		/* Length will be in network format, change it to host */
+ 		pkt_len = mlan_ntohs(read_u16_unaligned(
+ 			priv->adapter, data + (2 * MLAN_MAC_ADDR_LENGTH)));
+-		if (pkt_len > total_pkt_len) {
++		if (!marvell_amsdu_padding((unsigned int)total_pkt_len,
++					   (unsigned int)pkt_len, hdr_len,
++					   &checked_pad)) {
+ 			PRINTM(MERROR, "Error in packet length.\n");
+ 			break;
+ 		}
+-
+-		pad = (((pkt_len + sizeof(Eth803Hdr_t)) & 3)) ?
+-			      (4 - ((pkt_len + sizeof(Eth803Hdr_t)) & 3)) :
+-			      0;
++		pad = (int)checked_pad;
+ 		data += pkt_len + pad + sizeof(Eth803Hdr_t);
+ 		total_pkt_len -= pkt_len + pad + sizeof(Eth803Hdr_t);
+ 		++pkt_count;
+@@ -433,6 +434,7 @@
+ 	mlan_adapter *pmadapter = priv->adapter;
+ 	t_u32 max_rx_data_size = pmadapter->rx_buf_size;
+ 	int pad;
++	unsigned int checked_pad;
+ 	mlan_status ret = MLAN_STATUS_FAILURE;
+ 	RxPacketHdr_t *prx_pkt;
+ 	mlan_buffer *daggr_mbuf = MNULL;
+@@ -524,21 +526,21 @@
+ 		/* Length will be in network format, change it to host */
+ 		pkt_len = mlan_ntohs(read_u16_unaligned(
+ 			priv->adapter, data + (2 * MLAN_MAC_ADDR_LENGTH)));
+-		if (pkt_len > total_pkt_len) {
++		if (!marvell_amsdu_padding((unsigned int)total_pkt_len,
++					   (unsigned int)pkt_len, hdr_len,
++					   &checked_pad)) {
+ 			PRINTM(MERROR,
+ 			       "Error in packet length: total_pkt_len = %d, pkt_len = %d\n",
+ 			       total_pkt_len, pkt_len);
+ 			ret = MLAN_STATUS_FAILURE;
+ 			break;
+ 		}
+-
+-		pad = (((pkt_len + sizeof(Eth803Hdr_t)) & 3)) ?
+-			      (4 - ((pkt_len + sizeof(Eth803Hdr_t)) & 3)) :
+-			      0;
++		pad = (int)checked_pad;
+ 
+ 		total_pkt_len -= pkt_len + pad + sizeof(Eth803Hdr_t);
+ 
+-		if (memcmp(pmadapter, &prx_pkt->rfc1042_hdr, rfc1042_eth_hdr,
++		if (pkt_len >= sizeof(Rfc1042Hdr_t) &&
++		    memcmp(pmadapter, &prx_pkt->rfc1042_hdr, rfc1042_eth_hdr,
+ 			   sizeof(rfc1042_eth_hdr)) == 0) {
+ 			memmove(pmadapter, data + LLC_SNAP_LEN, data,
+ 				(2 * MLAN_MAC_ADDR_LENGTH));
