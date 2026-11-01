@@ -26,8 +26,14 @@ extern "C" {
 namespace MarvellW8897MlanHost {
 
 struct DmaMapping;
+struct Allocation;
 struct Context {
     MarvellW8897Controller* controller;
+    IOSimpleLock* atomicPoolLock;
+    Allocation* atomicFree;
+    t_u32 atomicPoolCount;
+    t_u32 atomicPoolAvailable;
+    t_u64 atomicPoolFailures;
     mlan_device device;
     void* adapter;
     IOLock* mappingLock;
@@ -104,12 +110,82 @@ bool isShuttingDown(const Context* host)
 void beginShutdown(Context* host)
 { __atomic_store_n(&host->shuttingDown, 1U, __ATOMIC_RELEASE); }
 
+} // namespace
+
 struct Allocation {
     size_t total;
     uint64_t magic;
+    Context* poolOwner;
+    Allocation* next;
 };
+
+namespace {
 constexpr uint64_t kAllocationMagic = 0x4d4c414e38383937ULL;
 constexpr t_u32 kDmaFromDevice = 2;
+constexpr size_t kAtomicAllocationSize = 16384;
+constexpr unsigned kAtomicAllocationCount = 256;
+
+bool initializeAtomicPool(Context* host)
+{
+    host->atomicPoolLock = IOSimpleLockAlloc();
+    if (!host->atomicPoolLock) return false;
+    for (unsigned i = 0; i < kAtomicAllocationCount; ++i) {
+        auto* entry = static_cast<Allocation*>(
+            IOMalloc(sizeof(Allocation) + kAtomicAllocationSize));
+        if (!entry) return false;
+        entry->total = sizeof(Allocation) + kAtomicAllocationSize;
+        entry->magic = 0;
+        entry->poolOwner = host;
+        entry->next = host->atomicFree;
+        host->atomicFree = entry;
+        ++host->atomicPoolCount;
+        ++host->atomicPoolAvailable;
+    }
+    return true;
+}
+
+bool destroyAtomicPool(Context* host)
+{
+    // Called only after the core and its workers have stopped. If MLAN still
+    // owns an entry, leave the host and pool alive rather than freeing memory
+    // that might still be in use.
+    if (host->atomicPoolAvailable != host->atomicPoolCount) {
+        IOLog("MarvellW8897: atomic pool still has outstanding allocations; retaining pool\n");
+        return false;
+    }
+    while (host->atomicFree) {
+        Allocation* entry = host->atomicFree;
+        host->atomicFree = entry->next;
+        IOFree(entry, sizeof(Allocation) + kAtomicAllocationSize);
+    }
+    if (host->atomicPoolLock) IOSimpleLockFree(host->atomicPoolLock);
+    return true;
+}
+
+void* allocateAtomic(Context* host, size_t size)
+{
+    if (!host || !host->atomicPoolLock || size > kAtomicAllocationSize) {
+        if (host) __atomic_add_fetch(&host->atomicPoolFailures, 1, __ATOMIC_RELAXED);
+        return nullptr;
+    }
+    IOSimpleLockLock(host->atomicPoolLock);
+    Allocation* entry = host->atomicFree;
+    if (entry) {
+        host->atomicFree = entry->next;
+        --host->atomicPoolAvailable;
+        entry->next = nullptr;
+        entry->total = sizeof(Allocation) + size;
+        entry->magic = kAllocationMagic;
+    }
+    IOSimpleLockUnlock(host->atomicPoolLock);
+    if (!entry) {
+        __atomic_add_fetch(&host->atomicPoolFailures, 1, __ATOMIC_RELAXED);
+        return nullptr;
+    }
+    void* data = entry + 1;
+    bzero(data, size);
+    return data;
+}
 
 void* allocate(size_t size)
 {
@@ -119,6 +195,8 @@ void* allocate(size_t size)
     if (!header) return nullptr;
     header->total = total;
     header->magic = kAllocationMagic;
+    header->poolOwner = nullptr;
+    header->next = nullptr;
     void* data = header + 1;
     bzero(data, size);
     return data;
@@ -134,6 +212,15 @@ void deallocate(void* data)
     }
     const size_t total = header->total;
     header->magic = 0;
+    if (header->poolOwner) {
+        Context* host = header->poolOwner;
+        IOSimpleLockLock(host->atomicPoolLock);
+        header->next = host->atomicFree;
+        host->atomicFree = header;
+        ++host->atomicPoolAvailable;
+        IOSimpleLockUnlock(host->atomicPoolLock);
+        return;
+    }
     IOFree(header, total);
 }
 
@@ -158,10 +245,11 @@ bool packetDataWithinAllocation(const mlan_buffer* packet)
            packet->data_len <= available - packet->data_offset;
 }
 
-mlan_status mallocCallback(t_void*, t_u32 size, t_u32, t_u8** out)
+mlan_status mallocCallback(t_void* value, t_u32 size, t_u32 flags, t_u8** out)
 {
     if (!out) return MLAN_STATUS_FAILURE;
-    *out = static_cast<t_u8*>(allocate(size));
+    *out = static_cast<t_u8*>((flags & MLAN_MEM_FLAG_ATOMIC)
+        ? allocateAtomic(static_cast<Context*>(value), size) : allocate(size));
     return *out ? MLAN_STATUS_SUCCESS : MLAN_STATUS_FAILURE;
 }
 
@@ -1186,6 +1274,11 @@ Context* registerCore(MarvellW8897Controller* controller)
     if (!host) return nullptr;
     bzero(host, sizeof(*host));
     host->controller = controller;
+    if (!initializeAtomicPool(host)) {
+        destroyAtomicPool(host);
+        IOFree(host, sizeof(*host));
+        return nullptr;
+    }
     host->mappingLock = IOLockAlloc();
     host->infoLock = IOLockAlloc();
     host->scanLock = IOLockAlloc();
@@ -1195,6 +1288,7 @@ Context* registerCore(MarvellW8897Controller* controller)
         if (host->scanLock) IOLockFree(host->scanLock);
         if (host->infoLock) IOLockFree(host->infoLock);
         if (host->mappingLock) IOLockFree(host->mappingLock);
+        destroyAtomicPool(host);
         IOFree(host, sizeof(*host));
         return nullptr;
     }
@@ -1222,6 +1316,7 @@ Context* registerCore(MarvellW8897Controller* controller)
         IOLockFree(host->scanLock);
         IOLockFree(host->infoLock);
         IOLockFree(host->mappingLock);
+        destroyAtomicPool(host);
         IOFree(host, sizeof(*host));
         return nullptr;
     }
@@ -1334,7 +1429,7 @@ Context* registerCore(MarvellW8897Controller* controller)
         IOLockFree(host->infoLock);
         IOLockFree(host->scanLock);
         IOLockFree(host->connectLock);
-        IOFree(host, sizeof(*host));
+        if (destroyAtomicPool(host)) IOFree(host, sizeof(*host));
         return nullptr;
     }
     IOLog("MarvellW8897: NXP MLAN PCIe 8897 core registered\n");
@@ -1372,7 +1467,7 @@ void unregisterCore(Context* host)
     IOLockFree(host->infoLock);
     IOLockFree(host->scanLock);
     IOLockFree(host->connectLock);
-    IOFree(host, sizeof(*host));
+    if (destroyAtomicPool(host)) IOFree(host, sizeof(*host));
 }
 
 unsigned startFirmware(Context* host, bool msiInterrupt)
