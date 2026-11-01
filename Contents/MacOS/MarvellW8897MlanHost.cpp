@@ -32,6 +32,10 @@ struct Context {
     void* adapter;
     IOLock* mappingLock;
     DmaMapping* mappings;
+    DmaMapping* reusableRxMappings;
+    t_u32 reusableRxCount;
+    t_u64 reusableRxHits;
+    t_u64 rxMappingsCreated;
     thread_call_t mainCall;
     thread_call_t rxCall;
     thread_call_t txCall;
@@ -105,6 +109,7 @@ struct Allocation {
     uint64_t magic;
 };
 constexpr uint64_t kAllocationMagic = 0x4d4c414e38383937ULL;
+constexpr t_u32 kDmaFromDevice = 2;
 
 void* allocate(size_t size)
 {
@@ -460,6 +465,49 @@ DmaMapping* takeMapping(Context* host, t_u8* bytes, t_u64 address, t_u32 size, b
     return found;
 }
 
+// Keep a bounded pool of prepared RX bounce buffers. The 8897 replaces its
+// receive ring buffer after each packet, so otherwise every packet allocates
+// and prepares a new IODMACommand and physically contiguous buffer.
+DmaMapping* takeReusableRxMapping(Context* host, t_u32 size)
+{
+    IOLockLock(host->mappingLock);
+    DmaMapping** link = &host->reusableRxMappings;
+    while (*link && (*link)->size != size) link = &(*link)->next;
+    DmaMapping* mapping = *link;
+    if (mapping) {
+        *link = mapping->next;
+        --host->reusableRxCount;
+        __atomic_fetch_add(&host->reusableRxHits, 1ULL, __ATOMIC_RELAXED);
+    }
+    IOLockUnlock(host->mappingLock);
+    return mapping;
+}
+
+bool cacheRxMapping(Context* host, DmaMapping* mapping)
+{
+    bool cached = false;
+    IOLockLock(host->mappingLock);
+    if (!isShuttingDown(host) && host->reusableRxCount < 128) {
+        mapping->caller = nullptr;
+        mapping->next = host->reusableRxMappings;
+        host->reusableRxMappings = mapping;
+        ++host->reusableRxCount;
+        cached = true;
+    }
+    IOLockUnlock(host->mappingLock);
+    return cached;
+}
+
+void releaseCachedRxMappings(Context* host)
+{
+    while (host->reusableRxMappings) {
+        DmaMapping* mapping = host->reusableRxMappings;
+        host->reusableRxMappings = mapping->next;
+        releaseMapping(mapping);
+    }
+    host->reusableRxCount = 0;
+}
+
 mlan_status allocDmaCallback(t_void* value, t_u32 size, t_u8** out, t_u64* address)
 {
     auto* host = static_cast<Context*>(value);
@@ -490,7 +538,13 @@ mlan_status mapCallback(t_void* value, t_u8* bytes, t_u64* address,
     auto* host = static_cast<Context*>(value);
     if (!host || !bytes || !address || direction > 2) return MLAN_STATUS_FAILURE;
     *address = 0;
-    DmaMapping* mapping = createMapping(size);
+    DmaMapping* mapping = direction == kDmaFromDevice
+        ? takeReusableRxMapping(host, size) : nullptr;
+    if (!mapping) {
+        mapping = createMapping(size);
+        if (mapping && direction == kDmaFromDevice)
+            __atomic_fetch_add(&host->rxMappingsCreated, 1ULL, __ATOMIC_RELAXED);
+    }
     if (!mapping) return MLAN_STATUS_FAILURE;
     mapping->owned = false;
     mapping->caller = bytes;
@@ -519,7 +573,9 @@ mlan_status unmapCallback(t_void* value, t_u8* bytes, t_u64 address,
             result = MLAN_STATUS_FAILURE;
         else bcopy(mapping->bytes, bytes, size);
     }
-    releaseMapping(mapping);
+    if (result != MLAN_STATUS_SUCCESS || mapping->direction != kDmaFromDevice ||
+        !cacheRxMapping(static_cast<Context*>(value), mapping))
+        releaseMapping(mapping);
     return result;
 }
 
@@ -648,8 +704,12 @@ void networkCallFired(thread_call_param_t value, thread_call_param_t)
             return;
         }
         bcopy(mac, host->mac, MLAN_MAC_ADDR_LENGTH);
+        const t_u16 fwBands = host->infoData.param.fw_info.fw_bands;
+        const t_u16 region = host->infoData.param.fw_info.region_code;
         __atomic_store_n(&host->macValid, 1U, __ATOMIC_RELEASE);
         IOLockUnlock(host->infoLock);
+        host->controller->setProperty("MarvellFirmwareBands", fwBands, 16);
+        host->controller->setProperty("MarvellFirmwareRegion", region, 16);
     }
     host->controller->mlanCoreReady(
         host->mac, __atomic_load_n(&host->associated, __ATOMIC_ACQUIRE) != 0);
@@ -808,6 +868,7 @@ void connectCallFired(thread_call_param_t value, thread_call_param_t)
     t_u8 preferredBssid[MLAN_MAC_ADDR_LENGTH] = {};
     t_u16 preferredChannel = 0;
     t_u32 fiveGHzCount = 0;
+    t_u32 visibleFiveGHzCount = 0;
     if (phase == 8 && host->scanLock) {
         IOLockLock(host->scanLock);
         const auto& response = host->scanReadData.param.scan_resp;
@@ -821,6 +882,8 @@ void connectCallFired(thread_call_param_t value, thread_call_param_t)
             t_u8 bestSignal = 0;
             for (t_u32 i = 0; i < host->scanCount; ++i) {
                 const auto& entry = entries[i];
+                if (entry.channel > 14 && entry.channel <= 196)
+                    ++visibleFiveGHzCount;
                 if (entry.channel == 0 || entry.channel > 196 ||
                     entry.ssid.ssid_len != host->connectSsidLength ||
                     memcmp(entry.ssid.ssid, host->connectSsid,
@@ -917,6 +980,7 @@ void connectCallFired(thread_call_param_t value, thread_call_param_t)
     IOLockUnlock(host->connectLock);
     if (phase == 8 && host->controller) {
         host->controller->setProperty("MarvellScan5GHzCount", fiveGHzCount, 32);
+        host->controller->setProperty("MarvellScanAll5GHzCount", visibleFiveGHzCount, 32);
         host->controller->setProperty("MarvellPreferredChannel",
                                       publishedPreferredChannel, 16);
     }
@@ -1262,6 +1326,7 @@ Context* registerCore(MarvellW8897Controller* controller)
             host->mappings = mapping->next;
             releaseMapping(mapping);
         }
+        releaseCachedRxMappings(host);
         IOLockFree(host->mappingLock);
         IOLockFree(host->infoLock);
         IOLockFree(host->scanLock);
@@ -1299,6 +1364,7 @@ void unregisterCore(Context* host)
         host->mappings = mapping->next;
         releaseMapping(mapping);
     }
+    releaseCachedRxMappings(host);
     IOLockFree(host->mappingLock);
     IOLockFree(host->infoLock);
     IOLockFree(host->scanLock);
@@ -1336,6 +1402,12 @@ bool processInterrupt(Context* host)
 bool getStatus(Context* host, unsigned long long out[6])
 {
     if (!host || !out) return false;
+    if (host->controller) {
+        host->controller->setProperty("MarvellRxMappingReuseHits",
+            __atomic_load_n(&host->reusableRxHits, __ATOMIC_RELAXED), 64);
+        host->controller->setProperty("MarvellRxMappingsCreated",
+            __atomic_load_n(&host->rxMappingsCreated, __ATOMIC_RELAXED), 64);
+    }
     out[0] = host->adapter ? 1 : 0;
     out[1] = __atomic_load_n(&host->initComplete, __ATOMIC_ACQUIRE);
     out[2] = __atomic_load_n(&host->initStatus, __ATOMIC_ACQUIRE);
