@@ -131,6 +131,13 @@ static const IOExternalMethodDispatch gDispatchTable[kMarvellMethodCount] = {
         0,
         4,
         0
+    },
+    { // IRQ, deferred-work, and frame-boundary accounting
+        (IOExternalMethodAction)&MarvellW8897UserClient::sGetMlanTelemetry,
+        0,
+        0,
+        13,
+        0
     }
 };
 
@@ -433,5 +440,15 @@ IOReturn MarvellW8897UserClient::sGetMlanConnectStatus(MarvellW8897UserClient* t
     if (!target->fOwner->getMlanConnectStatus(status)) return kIOReturnError;
     for (unsigned i = 0; i < 4; ++i) args->scalarOutput[i] = status[i];
     args->scalarOutputCount = 4;
+    return kIOReturnSuccess;
+}
+
+IOReturn MarvellW8897UserClient::sGetMlanTelemetry(MarvellW8897UserClient* target,
+                                                    void*, IOExternalMethodArguments* args)
+{
+    uint64_t telemetry[13] = {};
+    if (!target->fOwner->getMlanTelemetry(telemetry)) return kIOReturnError;
+    for (unsigned i = 0; i < 13; ++i) args->scalarOutput[i] = telemetry[i];
+    args->scalarOutputCount = 13;
     return kIOReturnSuccess;
 }

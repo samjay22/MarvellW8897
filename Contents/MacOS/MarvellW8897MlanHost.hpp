@@ -18,6 +18,10 @@ void unregisterCore(Context* context);
 unsigned startFirmware(Context* context, bool msiInterrupt);
 bool processInterrupt(Context* context);
 bool getStatus(Context* context, unsigned long long out[6]);
+// Read-only accounting for correlation of PCIe interrupts, deferred MLAN
+// work, and frames crossing the macOS network boundary. This is deliberately
+// separate from getStatus so the existing six-word ABI remains stable.
+bool getTelemetry(Context* context, unsigned long long out[13]);
 // The caller retains the mbuf. MLAN owns its copy after a pending send.
 bool sendEthernetFrame(Context* context, mbuf_t packet, unsigned length);
 // A scan is asynchronous; getScanStatus reports phase, MLAN completion, and

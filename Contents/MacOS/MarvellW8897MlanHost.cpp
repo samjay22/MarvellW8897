@@ -61,6 +61,19 @@ struct Context {
     uint32_t shuttingDown;
     t_u32 lastEventId;
     t_u64 eventCount;
+    t_u64 interruptsAccepted;
+    t_u64 interruptsRejected;
+    t_u64 deferredMainEvents;
+    t_u64 deferredRxWorkEvents;
+    t_u64 deferredRxDataEvents;
+    t_u64 deferredTxEvents;
+    t_u64 deferredCommandEvents;
+    t_u64 otherEvents;
+    t_u64 rxWorkerRuns;
+    t_u64 rxFramesDelivered;
+    t_u64 rxFramesRejected;
+    t_u64 txFramesAccepted;
+    t_u64 txFramesRejected;
     t_u32 hwSpecStatus;
     t_u32 initStatus;
     t_u32 initComplete;
@@ -848,9 +861,13 @@ mlan_status completionReceivePacket(t_void* value, pmlan_buffer packet)
         packet->data_len < 14 || packet->data_len > 4096 ||
         !packetDataWithinAllocation(packet) || isShuttingDown(host))
         return MLAN_STATUS_FAILURE;
-    return host->controller->receiveEthernetFrame(
-        packet->pbuf + packet->data_offset, packet->data_len)
-        ? MLAN_STATUS_SUCCESS : MLAN_STATUS_FAILURE;
+    const bool delivered = host->controller->receiveEthernetFrame(
+        packet->pbuf + packet->data_offset, packet->data_len);
+    if (delivered)
+        __atomic_fetch_add(&host->rxFramesDelivered, 1ULL, __ATOMIC_RELAXED);
+    else
+        __atomic_fetch_add(&host->rxFramesRejected, 1ULL, __ATOMIC_RELAXED);
+    return delivered ? MLAN_STATUS_SUCCESS : MLAN_STATUS_FAILURE;
 }
 void networkCallFired(thread_call_param_t value, thread_call_param_t)
 {
@@ -1220,6 +1237,7 @@ void rxCallFired(thread_call_param_t value, thread_call_param_t)
 {
     auto* host = static_cast<Context*>(value);
     if (!host || !host->rxWorkLock) return;
+    __atomic_fetch_add(&host->rxWorkerRuns, 1ULL, __ATOMIC_RELAXED);
     IOLockLock(host->rxWorkLock);
     if (isShuttingDown(host) || !host->adapter) {
         IOLockUnlock(host->rxWorkLock);
@@ -1259,17 +1277,24 @@ mlan_status completionEvent(t_void* value, pmlan_event event)
         // the self-thread escape as a proof that reentrant cleanup is safe.
         return waitForRxWorker(host) ? MLAN_STATUS_SUCCESS : MLAN_STATUS_FAILURE;
     case MLAN_EVENT_ID_DRV_DEFER_HANDLING:
+        __atomic_fetch_add(&host->deferredMainEvents, 1ULL, __ATOMIC_RELAXED);
         scheduleCall(host, host->mainCall);
         break;
     case MLAN_EVENT_ID_DRV_DEFER_RX_WORK:
+        __atomic_fetch_add(&host->deferredRxWorkEvents, 1ULL, __ATOMIC_RELAXED);
+        scheduleCall(host, host->rxCall);
+        break;
     case MLAN_EVENT_ID_DRV_DEFER_RX_DATA:
+        __atomic_fetch_add(&host->deferredRxDataEvents, 1ULL, __ATOMIC_RELAXED);
         scheduleCall(host, host->rxCall);
         break;
     case MLAN_EVENT_ID_DRV_DEFER_TX_COMPLTE:
     case MLAN_EVENT_ID_DRV_DELAY_TX_COMPLETE:
+        __atomic_fetch_add(&host->deferredTxEvents, 1ULL, __ATOMIC_RELAXED);
         scheduleCall(host, host->txCall);
         break;
     case MLAN_EVENT_ID_DRV_DEFER_CMDRESP:
+        __atomic_fetch_add(&host->deferredCommandEvents, 1ULL, __ATOMIC_RELAXED);
         scheduleCall(host, host->commandCall);
         break;
     case MLAN_EVENT_ID_DRV_CONNECTED:
@@ -1317,6 +1342,7 @@ mlan_status completionEvent(t_void* value, pmlan_event event)
         }
         break;
     default:
+        __atomic_fetch_add(&host->otherEvents, 1ULL, __ATOMIC_RELAXED);
         break;
     }
     return MLAN_STATUS_SUCCESS;
@@ -1687,7 +1713,11 @@ unsigned startFirmware(Context* host, bool msiInterrupt)
 bool processInterrupt(Context* host)
 {
     if (!host || !host->adapter || isShuttingDown(host)) return false;
-    if (mlan_interrupt(0xffff, host->adapter) == MLAN_STATUS_FAILURE) return false;
+    if (mlan_interrupt(0xffff, host->adapter) == MLAN_STATUS_FAILURE) {
+        __atomic_fetch_add(&host->interruptsRejected, 1ULL, __ATOMIC_RELAXED);
+        return false;
+    }
+    __atomic_fetch_add(&host->interruptsAccepted, 1ULL, __ATOMIC_RELAXED);
     scheduleCall(host, host->mainCall);
     return true;
 }
@@ -1719,6 +1749,25 @@ bool getStatus(Context* host, unsigned long long out[6])
     return true;
 }
 
+bool getTelemetry(Context* host, unsigned long long out[13])
+{
+    if (!host || !out) return false;
+    out[0] = __atomic_load_n(&host->interruptsAccepted, __ATOMIC_RELAXED);
+    out[1] = __atomic_load_n(&host->interruptsRejected, __ATOMIC_RELAXED);
+    out[2] = __atomic_load_n(&host->deferredMainEvents, __ATOMIC_RELAXED);
+    out[3] = __atomic_load_n(&host->deferredRxWorkEvents, __ATOMIC_RELAXED);
+    out[4] = __atomic_load_n(&host->deferredRxDataEvents, __ATOMIC_RELAXED);
+    out[5] = __atomic_load_n(&host->deferredTxEvents, __ATOMIC_RELAXED);
+    out[6] = __atomic_load_n(&host->deferredCommandEvents, __ATOMIC_RELAXED);
+    out[7] = __atomic_load_n(&host->otherEvents, __ATOMIC_RELAXED);
+    out[8] = __atomic_load_n(&host->rxWorkerRuns, __ATOMIC_RELAXED);
+    out[9] = __atomic_load_n(&host->rxFramesDelivered, __ATOMIC_RELAXED);
+    out[10] = __atomic_load_n(&host->rxFramesRejected, __ATOMIC_RELAXED);
+    out[11] = __atomic_load_n(&host->txFramesAccepted, __ATOMIC_RELAXED);
+    out[12] = __atomic_load_n(&host->txFramesRejected, __ATOMIC_RELAXED);
+    return true;
+}
+
 bool sendEthernetFrame(Context* host, mbuf_t source, unsigned length)
 {
     if (!host || !host->adapter || !source || length < 14 || length > 1514 ||
@@ -1747,9 +1796,11 @@ bool sendEthernetFrame(Context* host, mbuf_t source, unsigned length)
     }
     const mlan_status status = mlan_send_packet(host->adapter, packet);
     if (status == MLAN_STATUS_PENDING) {
+        __atomic_fetch_add(&host->txFramesAccepted, 1ULL, __ATOMIC_RELAXED);
         scheduleCall(host, host->mainCall);
         return true;
     }
+    __atomic_fetch_add(&host->txFramesRejected, 1ULL, __ATOMIC_RELAXED);
     deallocate(packet);
     return false;
 }

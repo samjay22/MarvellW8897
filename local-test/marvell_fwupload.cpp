@@ -21,6 +21,7 @@ constexpr unsigned kScanSelector = 13;
 constexpr unsigned kScanStatusSelector = 14;
 constexpr unsigned kConnectSelector = 15;
 constexpr unsigned kConnectStatusSelector = 16;
+constexpr unsigned kTelemetrySelector = 17;
 struct ScanInput {
     uint32_t ssidLength;
     uint8_t ssid[32];
@@ -140,6 +141,7 @@ int main(int argc, char** argv)
     const bool scanOnly = (argc == 2 || argc == 3) &&
                           std::strcmp(argv[1], "--scan") == 0;
     const bool connectStatusOnly = argc == 2 && std::strcmp(argv[1], "--connect-status") == 0;
+    const bool telemetryOnly = argc == 2 && std::strcmp(argv[1], "--telemetry") == 0;
     const bool interfaceOnly = argc == 2 && std::strcmp(argv[1], "--interface") == 0;
     const bool connectWpa2 = argc == 3 && std::strcmp(argv[1], "--connect") == 0;
     const bool connectOpen = argc == 3 && std::strcmp(argv[1], "--connect-open") == 0;
@@ -148,7 +150,7 @@ int main(int argc, char** argv)
     const bool registerCore = startCore ||
         (argc == 3 && std::strcmp(argv[1], "--register-core") == 0);
     const bool uploadOnly = argc == 2 && argv[1][0] != '-';
-    if (!statusOnly && !scanStatusOnly && !scanOnly && !connectStatusOnly &&
+    if (!statusOnly && !scanStatusOnly && !scanOnly && !connectStatusOnly && !telemetryOnly &&
         !interfaceOnly &&
         !connectOnly && !uploadOnly && !registerCore) {
         std::cerr << "usage: sudo marvell_fwupload [--register-core|--start-core] /path/to/pcie8897_uapsta.bin\n"
@@ -158,12 +160,13 @@ int main(int argc, char** argv)
                   << "       sudo marvell_fwupload --connect SSID\n"
                   << "       sudo marvell_fwupload --connect-open SSID\n"
                   << "       marvell_fwupload --connect-status\n"
+                  << "       marvell_fwupload --telemetry\n"
                   << "       marvell_fwupload --interface\n";
         return 2;
     }
 
     std::vector<uint8_t> image;
-    if (!statusOnly && !scanStatusOnly && !scanOnly &&
+    if (!statusOnly && !scanStatusOnly && !scanOnly && !telemetryOnly &&
         !connectStatusOnly && !interfaceOnly && !connectOnly &&
         !readFirmware(argv[registerCore ? 2 : 1], image)) {
         std::cerr << "firmware file is missing or does not match the verified Surface image\n";
@@ -214,6 +217,33 @@ int main(int argc, char** argv)
                   << " hwSpecStatus=" << coreStatus[3]
                   << " lastEvent=0x" << std::hex << coreStatus[4] << std::dec
                   << " eventCount=" << coreStatus[5] << "\n";
+        return 0;
+    }
+
+    if (telemetryOnly) {
+        uint64_t telemetry[13] = {};
+        uint32_t count = 13;
+        kr = IOConnectCallMethod(connection, kTelemetrySelector,
+                                 nullptr, 0, nullptr, 0,
+                                 telemetry, &count, nullptr, nullptr);
+        IOServiceClose(connection);
+        if (kr != KERN_SUCCESS || count != 13) {
+            std::cerr << "cannot read MLAN telemetry: " << kr << "\n";
+            return 1;
+        }
+        std::cout << "irqAccepted=" << telemetry[0]
+                  << " irqRejected=" << telemetry[1]
+                  << " deferMain=" << telemetry[2]
+                  << " deferRxWork=" << telemetry[3]
+                  << " deferRxData=" << telemetry[4]
+                  << " deferTx=" << telemetry[5]
+                  << " deferCmd=" << telemetry[6]
+                  << " eventOther=" << telemetry[7]
+                  << " rxWorkers=" << telemetry[8]
+                  << " rxDelivered=" << telemetry[9]
+                  << " rxRejected=" << telemetry[10]
+                  << " txAccepted=" << telemetry[11]
+                  << " txRejected=" << telemetry[12] << "\n";
         return 0;
     }
 

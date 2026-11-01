@@ -75,6 +75,7 @@ public:
     IOReturn registerMlanCore();
     IOReturn startMlanFirmware();
     bool getMlanCoreStatus(uint64_t out[6]);
+    bool getMlanTelemetry(uint64_t out[13]);
     IOReturn requestMlanScan(const uint8_t* ssid, uint32_t length);
     bool getMlanScanStatus(uint64_t out[4]);
     IOReturn requestMlanConnect(const uint8_t* ssid, uint32_t ssidLength,

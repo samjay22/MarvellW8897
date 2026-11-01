@@ -30,6 +30,7 @@ enum {
     kMarvellMethodGetMlanScanStatus = 14,
     kMarvellMethodRequestMlanConnect = 15,
     kMarvellMethodGetMlanConnectStatus = 16,
+    kMarvellMethodGetMlanTelemetry = 17,
     kMarvellMethodCount
 };
 
@@ -107,6 +108,9 @@ public:
     static IOReturn sGetMlanConnectStatus(MarvellW8897UserClient* target,
                                           void* ref,
                                           IOExternalMethodArguments* args);
+    static IOReturn sGetMlanTelemetry(MarvellW8897UserClient* target,
+                                      void* ref,
+                                      IOExternalMethodArguments* args);
 };
 
 #endif

@@ -730,6 +730,22 @@ bool MarvellW8897Controller::getMlanCoreStatus(uint64_t out[6])
     return ok;
 }
 
+bool MarvellW8897Controller::getMlanTelemetry(uint64_t out[13])
+{
+    if (!out || !fFirmwareLock) return false;
+    IOLockLock(fFirmwareLock);
+    if (!fMlanContext) {
+        bzero(out, 13 * sizeof(uint64_t));
+        IOLockUnlock(fFirmwareLock);
+        return true;
+    }
+    unsigned long long telemetry[13] = {};
+    const bool ok = MarvellW8897MlanHost::getTelemetry(fMlanContext, telemetry);
+    for (unsigned i = 0; i < 13; ++i) out[i] = telemetry[i];
+    IOLockUnlock(fFirmwareLock);
+    return ok;
+}
+
 IOReturn MarvellW8897Controller::requestMlanScan(const uint8_t* ssid, uint32_t length)
 {
     if (length > 32 || (length != 0 && !ssid)) return kIOReturnBadArgument;

@@ -41,7 +41,7 @@ void IOLockUnlock(IOLock* p){p->m.unlock();}
 void IOLockSleep(IOLock* p,void*,unsigned){std::unique_lock<std::mutex> l(p->m,std::adopt_lock);p->cv.wait(l);l.release();}
 void IOLockWakeup(IOLock* p,void*,bool){p->cv.notify_all();}
 constexpr unsigned THREAD_UNINT=0; constexpr int RX_DATA=0;
-struct Context {IOLock* rxWorkLock{};thread_t rxWorker{};void* adapter{};uint32_t shuttingDown{};};
+struct Context {IOLock* rxWorkLock{};thread_t rxWorker{};void* adapter{};uint32_t shuttingDown{};uint64_t rxWorkerRuns{};};
 bool waitForRxWorker(Context* host);
 std::atomic<bool> entered{false}, allowExit{false}, selfAvoided{false};
 void mlan_process_pcie_interrupt_cb(void* value,int) {
@@ -65,9 +65,10 @@ int main() {
  assert(finished.load()==0);
  allowExit.store(true,std::memory_order_release);
  worker.join(); for(auto& waiter:waiters)waiter.join(); assert(finished.load()==8);
+ assert(host.rxWorkerRuns == 1);
  assert(waitForRxWorker(&host));
  __atomic_store_n(&host.shuttingDown,1U,__ATOMIC_RELEASE);
- entered.store(false); rxCallFired(&host,nullptr); assert(!entered.load());
+ entered.store(false); rxCallFired(&host,nullptr); assert(!entered.load()); assert(host.rxWorkerRuns == 2);
  std::puts("RX barrier: active-worker wait, eight waiters, self-wait guard, and shutdown passed.");
 }
 '''
