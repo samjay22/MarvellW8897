@@ -1228,6 +1228,9 @@ Context* registerCore(MarvellW8897Controller* controller)
     mlan_device& device = host->device;
     device.pmoal_handle = host;
     device.card_type = CARD_TYPE_PCIE8897;
+    // Match the NXP Linux host default: retain capabilities advertised by
+    // firmware. A zero mask strips every low capability bit, leaving 11b only.
+    device.dev_cap_mask = 0xffffffffU;
     // MLAN copies this into rx_buf_size before creating the PCIe RX ring.
     // The NXP Linux host defaults to 4 KiB when 8 KiB AMSDU RX is disabled.
     device.amsdu_rx_size = MLAN_RX_DATA_BUF_SIZE_4K;
