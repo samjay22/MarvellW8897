@@ -16,6 +16,7 @@ The three host-side concurrency harnesses support `MARVELL_SANITIZER=thread` as 
 
 ## Outstanding risks and limitations
 
+- **High priority: receive-work flush events are ignored.** `mlan_block_rx_process` can send `MLAN_EVENT_ID_DRV_FLUSH_RX_WORK` when receive processing is active, before reorder-table mutation or cleanup. The NXP Linux host waits for its receive workqueue; this host currently returns without waiting. That can allow reorder-table work to overlap receive processing. A safe implementation must account for callback context, avoid waiting on itself or while holding a required lock, and ensure no new RX work escapes the barrier. Do not assume the scheduling gate fixes this.
 - The candidate and its worker shutdown sequence have not been tested in the macOS kernel, across association, sustained traffic, reconnect, sleep, or shutdown. Local tests replace the kernel locks and scheduler with user-space stubs.
 - Work-item and timer stop/start sequencing still needs a concurrency audit; `thread_call_cancel_wait` is not a general barrier against later submissions, and timer destruction must not wait on a callback while holding a lock the callback needs. Interrupt callbacks and deferred frees must be fully quiesced before their context is destroyed.
 - MLAN uses a mixture of allocation flags; other callbacks that can block while MLAN holds a spinlock still need a complete call-context audit, including DMA mapping and timer destruction. The atomic pool fixes the observed call site, not every possible lock violation.
