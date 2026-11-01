@@ -1,4 +1,5 @@
 """Stress the driver's actual shutdown/submission gate with mock thread calls."""
+import os
 import pathlib
 import subprocess
 import tempfile
@@ -69,6 +70,6 @@ with tempfile.TemporaryDirectory() as directory:
     path = pathlib.Path(directory)
     (path / 'test.cpp').write_text(prefix + impl + main)
     subprocess.run(['clang++', '-std=c++17', '-O1', '-pthread',
-                    '-fsanitize=address,undefined', str(path / 'test.cpp'),
+                    '-fsanitize=' + os.environ.get('MARVELL_SANITIZER', 'address,undefined'), str(path / 'test.cpp'),
                     '-o', str(path / 'test')], check=True)
     subprocess.run([str(path / 'test')], check=True)

@@ -1,4 +1,5 @@
 """Exercise the actual DMA-map list helpers with user-space lock stand-ins."""
+import os
 import pathlib
 import subprocess
 import tempfile
@@ -20,7 +21,8 @@ def function(signature):
     raise ValueError(signature)
 
 impl = '\n'.join(function(s) for s in (
-    'unsigned mappingBucket(', 'void addMapping(', 'DmaMapping* takeMapping('))
+    'bool dmaRangeFits32Bit(', 'unsigned mappingBucket(', 'void addMapping(',
+    'DmaMapping* takeMapping('))
 prefix = r'''
 #include <cassert>
 #include <cstdint>
@@ -42,6 +44,13 @@ struct Context { IOLock* mappingLock{}; DmaMapping* mappings{};
 '''
 main = r'''
 int main() {
+ assert(!dmaRangeFits32Bit(0,0));
+ assert(dmaRangeFits32Bit(0xffffffffULL,1));
+ assert(!dmaRangeFits32Bit(0xffffffffULL,2));
+ assert(dmaRangeFits32Bit(0,0x100000000ULL));
+ assert(!dmaRangeFits32Bit(0,0x100000001ULL));
+ assert(!dmaRangeFits32Bit(0x100000000ULL,1));
+ assert(!dmaRangeFits32Bit(0xffffffffffffffffULL,0xffffffffffffffffULL));
  IOLock lock; Context host; host.mappingLock = &lock;
  constexpr int count = 512; std::vector<DmaMapping> nodes(count);
  for (int i=0; i<count; i++) {
@@ -95,6 +104,6 @@ with tempfile.TemporaryDirectory() as directory:
     path = pathlib.Path(directory)
     (path / 'test.cpp').write_text(prefix + impl + main)
     subprocess.run(['clang++', '-std=c++17', '-O1', '-pthread',
-                    '-fsanitize=address,undefined', str(path / 'test.cpp'),
+                    '-fsanitize=' + os.environ.get('MARVELL_SANITIZER', 'address,undefined'), str(path / 'test.cpp'),
                     '-o', str(path / 'test')], check=True)
     subprocess.run([str(path / 'test')], check=True)

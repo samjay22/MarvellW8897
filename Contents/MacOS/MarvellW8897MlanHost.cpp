@@ -572,6 +572,12 @@ void releaseMapping(DmaMapping* mapping)
     deallocate(mapping);
 }
 
+bool dmaRangeFits32Bit(t_u64 address, t_u64 size)
+{
+    constexpr t_u64 kAddressLimit = 0x100000000ULL;
+    return size != 0 && address < kAddressLimit && size <= kAddressLimit - address;
+}
+
 DmaMapping* createMapping(t_u32 size)
 {
     if (size == 0) return nullptr;
@@ -604,7 +610,8 @@ DmaMapping* createMapping(t_u32 size)
     IODMACommand::Segment64 segment {};
     UInt32 count = 1;
     if (mapping->command->gen64IOVMSegments(&offset, &segment, &count) != kIOReturnSuccess ||
-        count != 1 || segment.fLength < size || segment.fIOVMAddr > 0xffffffffULL) {
+        count != 1 || segment.fLength < size ||
+        !dmaRangeFits32Bit(segment.fIOVMAddr, size)) {
         releaseMapping(mapping);
         return nullptr;
     }
