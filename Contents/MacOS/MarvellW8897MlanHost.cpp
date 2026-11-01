@@ -41,6 +41,7 @@ struct Context {
     void* adapter;
     IOLock* mappingLock;
     DmaMapping* mappings;
+    DmaMapping* mappingBuckets[256];
     DmaMapping* reusableRxMappings;
     t_u32 reusableRxCount;
     t_u64 reusableRxHits;
@@ -94,6 +95,8 @@ struct Context {
 
 struct DmaMapping {
     DmaMapping* next;
+    DmaMapping* previous;
+    DmaMapping* bucketNext;
     IOBufferMemoryDescriptor* buffer;
     IODMACommand* command;
     t_u8* caller;
@@ -444,7 +447,10 @@ mlan_status initTimerCallback(t_void*, t_void** out,
     timer->lock = IOSimpleLockAlloc();
     timer->callback = callback;
     timer->context = context;
-    timer->call = thread_call_allocate(timerFired, timer);
+    // Serializing invocations also lets cancel_wait wait for a running
+    // callback when a re-armed invocation was pending.
+    timer->call = thread_call_allocate_with_options(
+        timerFired, timer, THREAD_CALL_PRIORITY_HIGH, THREAD_CALL_OPTIONS_ONCE);
     if (!timer->lock || !timer->call) {
         if (timer->call) thread_call_free(timer->call);
         if (timer->lock) IOSimpleLockFree(timer->lock);
@@ -583,11 +589,24 @@ DmaMapping* createMapping(t_u32 size)
     return mapping;
 }
 
+unsigned mappingBucket(t_u64 address)
+{
+    // The DMA mappings are commonly page-aligned; mix higher address bits
+    // rather than using the low byte directly.
+    return static_cast<unsigned>(((address >> 8) ^ (address >> 16) ^
+                                  (address >> 24)) & 255U);
+}
+
 void addMapping(Context* host, DmaMapping* mapping)
 {
     IOLockLock(host->mappingLock);
+    const unsigned bucket = mappingBucket(mapping->address);
+    mapping->previous = nullptr;
     mapping->next = host->mappings;
+    if (mapping->next) mapping->next->previous = mapping;
     host->mappings = mapping;
+    mapping->bucketNext = host->mappingBuckets[bucket];
+    host->mappingBuckets[bucket] = mapping;
     IOLockUnlock(host->mappingLock);
 }
 
@@ -595,13 +614,21 @@ DmaMapping* takeMapping(Context* host, t_u8* bytes, t_u64 address, t_u32 size, b
 {
     if (!host || !host->mappingLock) return nullptr;
     IOLockLock(host->mappingLock);
-    DmaMapping** link = &host->mappings;
+    DmaMapping** link = &host->mappingBuckets[mappingBucket(address)];
     while (*link && ((*link)->caller != bytes || (*link)->address != address ||
                      (*link)->size != size || (*link)->owned != owned)) {
-        link = &(*link)->next;
+        link = &(*link)->bucketNext;
     }
     DmaMapping* found = *link;
-    if (found) *link = found->next;
+    if (found) {
+        *link = found->bucketNext;
+        if (found->previous) found->previous->next = found->next;
+        else host->mappings = found->next;
+        if (found->next) found->next->previous = found->previous;
+        found->next = nullptr;
+        found->previous = nullptr;
+        found->bucketNext = nullptr;
+    }
     IOLockUnlock(host->mappingLock);
     return found;
 }
@@ -727,9 +754,9 @@ mlan_status syncDmaCallback(t_void* value, t_u32 size, t_u64 address,
     if (!host || !host->mappingLock || direction > MOAL_DMA_SYNC_FROM_DEVICE)
         return MLAN_STATUS_FAILURE;
     IOLockLock(host->mappingLock);
-    DmaMapping* mapping = host->mappings;
+    DmaMapping* mapping = host->mappingBuckets[mappingBucket(address)];
     while (mapping && (mapping->address != address || size > mapping->size))
-        mapping = mapping->next;
+        mapping = mapping->bucketNext;
     if (!mapping) {
         IOLockUnlock(host->mappingLock);
         return MLAN_STATUS_FAILURE;
@@ -1359,14 +1386,25 @@ Context* registerCore(MarvellW8897Controller* controller)
         IOFree(host, sizeof(*host));
         return nullptr;
     }
-    host->mainCall = thread_call_allocate(mainCallFired, host);
-    host->rxCall = thread_call_allocate(rxCallFired, host);
-    host->txCall = thread_call_allocate(txCallFired, host);
-    host->commandCall = thread_call_allocate(commandCallFired, host);
-    host->networkCall = thread_call_allocate(networkCallFired, host);
-    host->scanReadCall = thread_call_allocate(scanReadCallFired, host);
-    host->connectCall = thread_call_allocate(connectCallFired, host);
-    host->connectTimeoutCall = thread_call_allocate(connectTimeoutFired, host);
+    // A regular thread call can have a running invocation and a pending
+    // invocation simultaneously; cancel_wait may cancel only the latter.
+    // ONCE serializes re-submissions and waits for the active invocation.
+    host->mainCall = thread_call_allocate_with_options(
+        mainCallFired, host, THREAD_CALL_PRIORITY_HIGH, THREAD_CALL_OPTIONS_ONCE);
+    host->rxCall = thread_call_allocate_with_options(
+        rxCallFired, host, THREAD_CALL_PRIORITY_HIGH, THREAD_CALL_OPTIONS_ONCE);
+    host->txCall = thread_call_allocate_with_options(
+        txCallFired, host, THREAD_CALL_PRIORITY_HIGH, THREAD_CALL_OPTIONS_ONCE);
+    host->commandCall = thread_call_allocate_with_options(
+        commandCallFired, host, THREAD_CALL_PRIORITY_HIGH, THREAD_CALL_OPTIONS_ONCE);
+    host->networkCall = thread_call_allocate_with_options(
+        networkCallFired, host, THREAD_CALL_PRIORITY_HIGH, THREAD_CALL_OPTIONS_ONCE);
+    host->scanReadCall = thread_call_allocate_with_options(
+        scanReadCallFired, host, THREAD_CALL_PRIORITY_HIGH, THREAD_CALL_OPTIONS_ONCE);
+    host->connectCall = thread_call_allocate_with_options(
+        connectCallFired, host, THREAD_CALL_PRIORITY_HIGH, THREAD_CALL_OPTIONS_ONCE);
+    host->connectTimeoutCall = thread_call_allocate_with_options(
+        connectTimeoutFired, host, THREAD_CALL_PRIORITY_HIGH, THREAD_CALL_OPTIONS_ONCE);
     if (!host->mainCall || !host->rxCall || !host->txCall ||
         !host->commandCall || !host->networkCall || !host->scanReadCall ||
         !host->connectCall || !host->connectTimeoutCall) {
@@ -1571,10 +1609,19 @@ bool getStatus(Context* host, unsigned long long out[6])
 {
     if (!host || !out) return false;
     if (host->controller) {
+        t_u32 atomicAvailable = 0;
+        if (host->atomicPoolLock) {
+            IOSimpleLockLock(host->atomicPoolLock);
+            atomicAvailable = host->atomicPoolAvailable;
+            IOSimpleLockUnlock(host->atomicPoolLock);
+        }
         host->controller->setProperty("MarvellRxMappingReuseHits",
             __atomic_load_n(&host->reusableRxHits, __ATOMIC_RELAXED), 64);
         host->controller->setProperty("MarvellRxMappingsCreated",
             __atomic_load_n(&host->rxMappingsCreated, __ATOMIC_RELAXED), 64);
+        host->controller->setProperty("MarvellAtomicPoolAvailable", atomicAvailable, 32);
+        host->controller->setProperty("MarvellAtomicPoolFailures",
+            __atomic_load_n(&host->atomicPoolFailures, __ATOMIC_RELAXED), 64);
     }
     out[0] = host->adapter ? 1 : 0;
     out[1] = __atomic_load_n(&host->initComplete, __ATOMIC_ACQUIRE);
