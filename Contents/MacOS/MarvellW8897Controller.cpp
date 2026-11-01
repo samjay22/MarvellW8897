@@ -812,7 +812,10 @@ void MarvellW8897Controller::mlanCoreReady(const uint8_t mac[6], bool associated
 
     if (!fNetworkInterface) {
         OSDictionary* media = OSDictionary::withCapacity(1);
-        IONetworkMedium* automatic = IONetworkMedium::medium(kIOMediumEthernetAuto, 0);
+        // Publish a nonzero nominal link rate until MLAN exposes the actual
+        // negotiated rate. macOS uses this value for the interface bandwidth.
+        IONetworkMedium* automatic = IONetworkMedium::medium(
+            kIOMediumEthernetAuto, 100000000ULL);
         IONetworkInterface* attached = nullptr;
         if (!media || !automatic || !IONetworkMedium::addMedium(media, automatic) ||
             !publishMediumDictionary(media) ||

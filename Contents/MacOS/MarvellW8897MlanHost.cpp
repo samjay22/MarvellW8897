@@ -716,6 +716,7 @@ void finishConnectStep(Context* host, mlan_status status, t_u32 expectedPhase)
     if (!host || !host->connectLock) return;
     bool next = false;
     bool awaitEvent = false;
+    t_u16 selectedChannel = 0;
     IOLockLock(host->connectLock);
     if (host->connectPhase == expectedPhase && expectedPhase >= 2 &&
         expectedPhase <= 9 && host->connectPending &&
@@ -728,6 +729,8 @@ void finishConnectStep(Context* host, mlan_status status, t_u32 expectedPhase)
             bzero(&host->connectSecurity, sizeof(host->connectSecurity));
         }
         if (status == MLAN_STATUS_SUCCESS) {
+            if (oldPhase == 8)
+                selectedChannel = host->connectBss.param.ssid_bssid.channel;
             host->connectPhase = oldPhase == 9 ? 10 : oldPhase + 1;
             next = oldPhase != 9;
             awaitEvent = oldPhase == 9;
@@ -737,6 +740,9 @@ void finishConnectStep(Context* host, mlan_status status, t_u32 expectedPhase)
         }
     }
     IOLockUnlock(host->connectLock);
+    if (selectedChannel && host->controller)
+        host->controller->setProperty("MarvellAssociatedChannel",
+                                      selectedChannel, 16);
     if (next && !isShuttingDown(host)) thread_call_enter(host->connectCall);
     if (awaitEvent && !isShuttingDown(host) && host->connectTimeoutCall) {
         uint64_t deadline = 0;
@@ -1080,6 +1086,9 @@ Context* registerCore(MarvellW8897Controller* controller)
     // The NXP Linux host defaults to 4 KiB when 8 KiB AMSDU RX is disabled.
     device.amsdu_rx_size = MLAN_RX_DATA_BUF_SIZE_4K;
     device.indication_gpio = 0xff;
+    // Keep the radio awake while Recovery downloads the installer. MLAN's
+    // default PSP mode can add latency and reduce sustained receive throughput.
+    device.ps_mode = MLAN_INIT_PARA_DISABLED;
     // This Surface's Linux log disables deep sleep for PCI revision 0.
     // NXP MLAN otherwise enables auto deep sleep by default.
     device.auto_ds = MLAN_INIT_PARA_DISABLED;
