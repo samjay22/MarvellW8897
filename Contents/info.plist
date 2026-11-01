@@ -22,13 +22,19 @@
 
   <key>OSBundleLibraries</key>
   <dict>
+    <key>com.apple.kpi.bsd</key>
+    <string>8.0.0</string>
     <key>com.apple.iokit.IOPCIFamily</key>
     <string>2.5</string>
+    <key>com.apple.iokit.IONetworkingFamily</key>
+    <string>3.4</string>
     <key>com.apple.kpi.iokit</key>
     <string>8.0.0</string>
     <key>com.apple.kpi.libkern</key>
     <string>8.0.0</string>
     <key>com.apple.kpi.mach</key>
+    <string>8.0.0</string>
+    <key>com.apple.kpi.unsupported</key>
     <string>8.0.0</string>
   </dict>
 
@@ -53,12 +59,6 @@
       <!-- Vendor: 0x11ab, Device: 0x2b38 → 0x2b3811ab -->
       <key>IOPCIPrimaryMatch</key>
       <string>0x2b3811ab</string>
-
-      <!-- Optioneel: alleen in IOPCIMatch werken, maar PrimaryMatch is genoeg -->
-      <key>IONameMatch</key>
-      <array>
-        <string>pci11ab,2b38</string>
-      </array>
 
       <!-- Mag laag blijven voor ontwikkeling -->
       <key>IOProbeScore</key>

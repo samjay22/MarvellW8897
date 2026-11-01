@@ -29,7 +29,7 @@ enum class MarvellW8897BringupFailureReason : UInt32 {
     Timeout,
     NoGroundedResetSemantic,
     NoTransportProfile,
-    UnsupportedBar0,
+    UnavailableRegisterBar,
 };
 
 struct MarvellW8897BringupResult {

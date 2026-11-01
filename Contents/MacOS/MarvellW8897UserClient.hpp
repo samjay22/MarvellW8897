@@ -22,6 +22,14 @@ enum {
     kMarvellMethodWriteReg32ToBarWithFlush = 6,
     kMarvellMethodGetDebugAbiInfo = 7,
     kMarvellMethodGetBringupResult = 8,
+    kMarvellMethodUploadFirmware = 9,
+    kMarvellMethodRegisterMlanCore = 10,
+    kMarvellMethodStartMlanFirmware = 11,
+    kMarvellMethodGetMlanCoreStatus = 12,
+    kMarvellMethodRequestMlanScan = 13,
+    kMarvellMethodGetMlanScanStatus = 14,
+    kMarvellMethodRequestMlanConnect = 15,
+    kMarvellMethodGetMlanConnectStatus = 16,
     kMarvellMethodCount
 };
 
@@ -75,6 +83,30 @@ public:
     static IOReturn sGetBringupResult(MarvellW8897UserClient* target,
                                       void* ref,
                                       IOExternalMethodArguments* args);
+    static IOReturn sUploadFirmware(MarvellW8897UserClient* target,
+                                    void* ref,
+                                    IOExternalMethodArguments* args);
+    static IOReturn sRegisterMlanCore(MarvellW8897UserClient* target,
+                                      void* ref,
+                                      IOExternalMethodArguments* args);
+    static IOReturn sStartMlanFirmware(MarvellW8897UserClient* target,
+                                       void* ref,
+                                       IOExternalMethodArguments* args);
+    static IOReturn sGetMlanCoreStatus(MarvellW8897UserClient* target,
+                                       void* ref,
+                                       IOExternalMethodArguments* args);
+    static IOReturn sRequestMlanScan(MarvellW8897UserClient* target,
+                                     void* ref,
+                                     IOExternalMethodArguments* args);
+    static IOReturn sGetMlanScanStatus(MarvellW8897UserClient* target,
+                                       void* ref,
+                                       IOExternalMethodArguments* args);
+    static IOReturn sRequestMlanConnect(MarvellW8897UserClient* target,
+                                        void* ref,
+                                        IOExternalMethodArguments* args);
+    static IOReturn sGetMlanConnectStatus(MarvellW8897UserClient* target,
+                                          void* ref,
+                                          IOExternalMethodArguments* args);
 };
 
 #endif

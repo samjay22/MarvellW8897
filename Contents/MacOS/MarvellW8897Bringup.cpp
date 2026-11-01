@@ -3,7 +3,9 @@
 
 namespace {
 
-constexpr UInt32 kBringupBarIndex = 0;
+// mwifiex maps PCI BAR2 as its register window for 88W8897. BAR0 is a
+// separate memory region and must not be used for the scratch registers.
+constexpr UInt32 kBringupBarIndex = 2;
 constexpr UInt32 kRegisterWidth = sizeof(UInt32);
 
 bool validateAccess(const MarvellW8897PciBarState& pciBars,
@@ -22,32 +24,12 @@ bool validateAccess(const MarvellW8897PciBarState& pciBars,
 
     if (!MarvellW8897PciBars::isMmioAccessValid(pciBars, barIndex, offset, kRegisterWidth)) {
         result.failureReason = (barIndex == kBringupBarIndex)
-                                   ? MarvellW8897BringupFailureReason::UnsupportedBar0
+                                   ? MarvellW8897BringupFailureReason::UnavailableRegisterBar
                                    : MarvellW8897BringupFailureReason::InvalidOffset;
         result.stage = MarvellW8897BringupStage::Failed;
         return false;
     }
 
-    return true;
-}
-
-bool readAndRecord(const MarvellW8897PciBarState& pciBars,
-                   MarvellW8897BringupResult& result,
-                   UInt32 barIndex,
-                   UInt32 offset,
-                   UInt32& valueOut)
-{
-    if (!validateAccess(pciBars, result, barIndex, offset)) {
-        return false;
-    }
-
-    if (!MarvellW8897Transport::readReg32FromBar(pciBars, barIndex, offset, valueOut)) {
-        result.failureReason = MarvellW8897BringupFailureReason::ReadFailed;
-        result.stage = MarvellW8897BringupStage::Failed;
-        return false;
-    }
-
-    result.lastValueRead = valueOut;
     return true;
 }
 
@@ -109,8 +91,8 @@ const char* failureReasonName(MarvellW8897BringupFailureReason reason)
             return "no-grounded-reset-semantic";
         case MarvellW8897BringupFailureReason::NoTransportProfile:
             return "no-transport-profile";
-        case MarvellW8897BringupFailureReason::UnsupportedBar0:
-            return "unsupported-bar0";
+        case MarvellW8897BringupFailureReason::UnavailableRegisterBar:
+            return "unavailable-register-bar";
     }
 
     return "unknown";
@@ -255,28 +237,10 @@ bool run(const MarvellW8897PciBarState& pciBars,
         }
     }
 
-    UInt32 firmwareStatusValue = 0;
-    if (!readAndRecord(pciBars, result, kBringupBarIndex, profile->firmwareStatusReg, firmwareStatusValue)) {
-        IOLog("MarvellW8897: bring-up firmware status read failed offset=0x%x reason=%s\n",
-              result.lastRegisterOffset,
-              failureReasonName(result.failureReason));
-        return false;
-    }
-
-    UInt32 driverReadyValue = 0;
-    if (!readAndRecord(pciBars, result, kBringupBarIndex, profile->driverReadyReg, driverReadyValue)) {
-        IOLog("MarvellW8897: bring-up driver-ready read failed offset=0x%x reason=%s\n",
-              result.lastRegisterOffset,
-              failureReasonName(result.failureReason));
-        return false;
-    }
-
     result.stage = MarvellW8897BringupStage::BarsMapped;
     result.pollIterations = 0;
     result.lastValueWritten = 0;
     result.quirkFlags = profile->quirkFlags;
-    result.firmwareStatusValue = firmwareStatusValue;
-    result.driverReadyValue = driverReadyValue;
     result.stage = MarvellW8897BringupStage::SanityChecked;
 
     transportState.firmwareReady = 0;
@@ -285,13 +249,11 @@ bool run(const MarvellW8897PciBarState& pciBars,
     result.failureReason = MarvellW8897BringupFailureReason::NoGroundedResetSemantic;
     result.stage = MarvellW8897BringupStage::Unsupported;
 
-    IOLog("MarvellW8897: bring-up scaffold initialized; fw=%s quirks=0x%x fwStatusReg=0x%x fwStatus=0x%x drvRdyReg=0x%x drvRdy=0x%x txWr=0x%x evtWr=0x%x active reset disabled (%s)\n",
+    IOLog("MarvellW8897: PCIe profile mapped; fw=%s quirks=0x%x fwStatusReg=0x%x drvRdyReg=0x%x txWr=0x%x evtWr=0x%x MMIO deferred until manual firmware upload (%s)\n",
           profile->defaultFirmwareName ? profile->defaultFirmwareName : "<none>",
           profile->quirkFlags,
           profile->firmwareStatusReg,
-          result.firmwareStatusValue,
           profile->driverReadyReg,
-          result.driverReadyValue,
           profile->txWritePointerReg,
           profile->eventWritePointerReg,
           failureReasonName(result.failureReason));

@@ -6,6 +6,7 @@
 #include <IOKit/pci/IOPCIDevice.h>
 
 struct MarvellW8897BarInfo {
+    IOMemoryMap*   directMap { nullptr };
     volatile void* mappedPtr { nullptr };
     UInt64       length { 0 };
     UInt32       mappedResource { MarvellW8897Regs::kInvalidResourceIndex };
@@ -16,11 +17,10 @@ struct MarvellW8897BarInfo {
     bool           is64Bit { false };
     bool           isContinuation { false };
     bool           present { false };
+    const char*    mappingStatus { "not-attempted" };
 };
 
 struct MarvellW8897ResourceInfo {
-    IOMemoryMap*   map { nullptr };
-    volatile void* mappedPtr { nullptr };
     UInt64       length { 0 };
     UInt64       physicalAddress { 0 };
     bool           claimed { false };
@@ -30,6 +30,7 @@ struct MarvellW8897PciBarState {
     MarvellW8897BarInfo      bars[MarvellW8897Regs::kMaxBars] {};
     MarvellW8897ResourceInfo resources[MarvellW8897Regs::kMaxResources] {};
     UInt32                 resourceCount { 0 };
+    UInt32                 resourceStatus { 0 };
 };
 
 namespace MarvellW8897PciBars {

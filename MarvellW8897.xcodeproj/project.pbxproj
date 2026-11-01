@@ -14,6 +14,9 @@
 		93D000052F430001005311BC /* MarvellW8897Transport.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 93D000182F430001005311BC /* MarvellW8897Transport.cpp */; };
 		93D000062F430001005311BC /* MarvellW8897Debug.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 93D0001A2F430001005311BC /* MarvellW8897Debug.cpp */; };
 		93D0001D2F430001005311BC /* MarvellW8897Bringup.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 93D0001E2F430001005311BC /* MarvellW8897Bringup.cpp */; };
+		93D000202F430001005311BC /* MarvellW8897FirmwareProtocol.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 93D000212F430001005311BC /* MarvellW8897FirmwareProtocol.cpp */; };
+		93D000232F430001005311BC /* MarvellW8897MlanHost.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 93D000242F430001005311BC /* MarvellW8897MlanHost.cpp */; };
+		93D000262F430001005311BC /* MarvellW8897EmbeddedFirmware.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 93D000272F430001005311BC /* MarvellW8897EmbeddedFirmware.cpp */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -33,6 +36,11 @@
 		93D0001C2F430001005311BC /* MarvellW8897Regs.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = MarvellW8897Regs.hpp; sourceTree = "<group>"; };
 		93D0001E2F430001005311BC /* MarvellW8897Bringup.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = MarvellW8897Bringup.cpp; sourceTree = "<group>"; };
 		93D0001F2F430001005311BC /* MarvellW8897Bringup.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = MarvellW8897Bringup.hpp; sourceTree = "<group>"; };
+		93D000212F430001005311BC /* MarvellW8897FirmwareProtocol.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = MarvellW8897FirmwareProtocol.cpp; sourceTree = "<group>"; };
+		93D000222F430001005311BC /* MarvellW8897FirmwareProtocol.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = MarvellW8897FirmwareProtocol.hpp; sourceTree = "<group>"; };
+		93D000242F430001005311BC /* MarvellW8897MlanHost.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = MarvellW8897MlanHost.cpp; sourceTree = "<group>"; };
+		93D000252F430001005311BC /* MarvellW8897MlanHost.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = MarvellW8897MlanHost.hpp; sourceTree = "<group>"; };
+		93D000272F430001005311BC /* MarvellW8897EmbeddedFirmware.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = MarvellW8897EmbeddedFirmware.cpp; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXGroup (additional) section */
@@ -51,6 +59,11 @@
 				93D000122F430001005311BC /* MarvellW8897Controller.hpp */,
 				93D0001E2F430001005311BC /* MarvellW8897Bringup.cpp */,
 				93D0001F2F430001005311BC /* MarvellW8897Bringup.hpp */,
+				93D000212F430001005311BC /* MarvellW8897FirmwareProtocol.cpp */,
+				93D000222F430001005311BC /* MarvellW8897FirmwareProtocol.hpp */,
+				93D000242F430001005311BC /* MarvellW8897MlanHost.cpp */,
+				93D000252F430001005311BC /* MarvellW8897MlanHost.hpp */,
+				93D000272F430001005311BC /* MarvellW8897EmbeddedFirmware.cpp */,
 				93D000132F430001005311BC /* MarvellW8897UserClient.cpp */,
 				93D000152F430001005311BC /* MarvellW8897UserClient.hpp */,
 				93D000162F430001005311BC /* MarvellW8897PciBars.cpp */,
@@ -119,6 +132,7 @@
 			isa = PBXNativeTarget;
 			buildConfigurationList = 93930E222F42AEAE004CD044 /* Build configuration list for PBXNativeTarget "MarvellW8897Kext" */;
 			buildPhases = (
+				93D000302F430001005311BC /* Build NXP MLAN core */,
 				93930E152F42AEAE004CD044 /* Headers */,
 				93930E162F42AEAE004CD044 /* Sources */,
 				93930E172F42AEAE004CD044 /* Frameworks */,
@@ -208,6 +222,25 @@
 		};
 /* End PBXResourcesBuildPhase section */
 
+/* Begin PBXShellScriptBuildPhase section */
+		93D000302F430001005311BC /* Build NXP MLAN core */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputPaths = (
+			);
+			name = "Build NXP MLAN core";
+			outputPaths = (
+				"$(PROJECT_DIR)/build/mlan-core/libmlan8897.a",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/bash;
+			shellScript = "\"$PROJECT_DIR/scripts/build_mlan_core.sh\"";
+		};
+/* End PBXShellScriptBuildPhase section */
+
 /* Begin PBXSourcesBuildPhase section */
 		93930E162F42AEAE004CD044 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
@@ -219,6 +252,9 @@
 				93D000052F430001005311BC /* MarvellW8897Transport.cpp in Sources */,
 				93D000062F430001005311BC /* MarvellW8897Debug.cpp in Sources */,
 				93D0001D2F430001005311BC /* MarvellW8897Bringup.cpp in Sources */,
+				93D000202F430001005311BC /* MarvellW8897FirmwareProtocol.cpp in Sources */,
+				93D000232F430001005311BC /* MarvellW8897MlanHost.cpp in Sources */,
+				93D000262F430001005311BC /* MarvellW8897EmbeddedFirmware.cpp in Sources */,
 				93D000032F430001005311BC /* MarvellW8897KextMain.c in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -245,16 +281,18 @@
 				CODE_SIGNING_ALLOWED = NO;
 				CODE_SIGNING_REQUIRED = NO;
 				CODE_SIGN_IDENTITY = "";
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				CURRENT_KEXT_VERSION = 1.0.0;
 				CURRENT_PROJECT_VERSION = 1.0.0;
 				DYLIB_CURRENT_VERSION = 1.0.0;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = Contents/info.plist;
+				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/nxp-mwifiex/mlan";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				KERNEL_EXTENSION_HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/MacKernelSDK/Headers";
 				KERNEL_FRAMEWORK_HEADERS = "$(PROJECT_DIR)/MacKernelSDK/Headers";
 				LIBRARY_SEARCH_PATHS = "$(PROJECT_DIR)/MacKernelSDK/Library/x86_64";
-				MACOSX_DEPLOYMENT_TARGET = 15.7;
+				MACOSX_DEPLOYMENT_TARGET = 15.4;
 				EXECUTABLE_NAME = "$(PRODUCT_NAME)";
 				MARKETING_VERSION = 1.0.0;
 				MODULE_NAME = "$(PRODUCT_BUNDLE_IDENTIFIER)";
@@ -271,6 +309,10 @@
 					"$(inherited)",
 					"-DKERNEL",
 					"-DKERNEL_PRIVATE",
+				);
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"$(PROJECT_DIR)/build/mlan-core/libmlan8897.a",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = brainworks.driver.MarvellW8897;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -290,16 +332,18 @@
 				CLANG_ENABLE_MODULES = NO;
 				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = NO;
 				CODE_SIGN_STYLE = Automatic;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				CURRENT_KEXT_VERSION = 1.0.0;
 				CURRENT_PROJECT_VERSION = 1.0.0;
 				DYLIB_CURRENT_VERSION = 1.0.0;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = Contents/info.plist;
+				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/nxp-mwifiex/mlan";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				KERNEL_EXTENSION_HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/MacKernelSDK/Headers";
 				KERNEL_FRAMEWORK_HEADERS = "$(PROJECT_DIR)/MacKernelSDK/Headers";
 				LIBRARY_SEARCH_PATHS = "$(PROJECT_DIR)/MacKernelSDK/Library/x86_64";
-				MACOSX_DEPLOYMENT_TARGET = 15.7;
+				MACOSX_DEPLOYMENT_TARGET = 15.4;
 				EXECUTABLE_NAME = "$(PRODUCT_NAME)";
 				MARKETING_VERSION = 1.0.0;
 				MODULE_NAME = "$(PRODUCT_BUNDLE_IDENTIFIER)";
@@ -316,6 +360,10 @@
 					"$(inherited)",
 					"-DKERNEL",
 					"-DKERNEL_PRIVATE",
+				);
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"$(PROJECT_DIR)/build/mlan-core/libmlan8897.a",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = brainworks.driver.MarvellW8897;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -379,7 +427,7 @@
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
 				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
-				MACOSX_DEPLOYMENT_TARGET = 15.7;
+				MACOSX_DEPLOYMENT_TARGET = 15.4;
 				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
 				MTL_FAST_MATH = YES;
 				ONLY_ACTIVE_ARCH = YES;
@@ -434,7 +482,7 @@
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
 				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
-				MACOSX_DEPLOYMENT_TARGET = 15.7;
+				MACOSX_DEPLOYMENT_TARGET = 15.4;
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
 				SDKROOT = macosx;

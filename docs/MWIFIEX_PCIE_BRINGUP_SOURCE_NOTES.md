@@ -176,7 +176,7 @@ Linux firmware programming is a mutating DMA/bootstrap operation and should rema
 
 ### Important gaps and corrections from source inspection
 
-1. **MMIO BAR target remains unresolved.** Linux maps both region/resource 0 and region/resource 2, but mwifiex register accessors use `pci_mmap1`, the region-2 mapping. The macOS/OpenCore report shows BAR0/resource0 and BAR2/resource1, both mapped memory windows of length `0x100000`; however, current manual readings do not prove that either is the semantic mwifiex register window. No write should be attempted until this mapping is better understood.
+1. **macOS BAR2 accessibility remains unresolved.** Linux maps both region/resource 0 and region/resource 2, and mwifiex register accessors use `pci_mmap1`, the region-2 mapping. A later live Ubuntu read confirms the physical card's active BAR2 contains the firmware-ready registers. The earlier macOS/OpenCore BAR2 zero/invalid reads still need explanation from PCI power, decode, or mapping state before interpreting firmware writes.
 2. **Driver-ready writes are not a reset.** Linux writes `0xfedcba00` to `drv_rdy` only as part of the post-firmware-download ready handshake, after masking spurious status bits. It also clears `drv_rdy` during cleanup/down. This supports deferring driver-ready writes until firmware download and interrupt/ring prerequisites are understood.
 3. **Reset is a PCI/PM operation, not a scratch-only write.** Upstream uses PCI FLR and Surface-specific D3cold power cycling for recovery. That is much broader than a single MMIO register write and should not be introduced as the first mutating runtime change.
 4. **Firmware upload implies DMA and doorbells.** The firmware downloader writes DMA addresses and lengths, rings `CPU_INTR_DOOR_BELL`, and polls `PCIE_CPU_INT_STATUS`. That should not be attempted before a deliberate firmware-loading milestone with rollback and hardware access.
@@ -243,9 +243,25 @@ Manual explicit reads collected on the Surface/OpenCore machine:
 | `0xC08C` | TX read / RX write pointer | `0x7d24c3d5` | `0xffffffff` | BAR2 returns the read-failure sentinel pattern for this offset; BAR0 is high-entropy-looking |
 | `0xC05C` | TX write / RX read pointer | `0xaa6b1167` | `0xffffffff` | BAR2 returns the read-failure sentinel pattern for this offset; BAR0 is high-entropy-looking |
 
+### Live Ubuntu BAR comparison on this Surface (2026-10-31)
+
+An SSH read-only snapshot with Ubuntu 24.04, kernel `6.10.3-surface-1`, and the bound `mwifiex_pcie` driver found PCI function `03:00.0` in D0 with memory decoding, bus mastering, and MSI enabled. Linux exposes BAR0 at `0xb9500000` and BAR2 at `0xb9400000`, both 1 MiB, 64-bit, and prefetchable. These addresses are allocated by this Ubuntu boot and are not expected to match macOS's addresses.
+
+| Offset | BAR0 while Linux Wi-Fi is active | BAR2 while Linux Wi-Fi is active |
+| ---: | ---: | ---: |
+| `0xC40` helper request/scratch2 | `0x00000000` | `0x00000010` |
+| `0xC44` firmware status/scratch3 | `0x00000000` | `0xfedcba00` |
+| `0xCF0` driver ready/scratch12 | `0x00000000` | `0xfedcba00` |
+| `0xCE8` event read pointer | `0x00000000` | `0x00000000` |
+| `0xCEC` event write pointer | `0x00000000` | `0x00000080` |
+| `0xC08C` TX read/RX write pointer | `0x42889803` | `0x041d0403` |
+| `0xC05C` TX write/RX read pointer | `0x7fffffff` | `0x041d0003` |
+
+This proves that Linux BAR2 is the semantic mwifiex register window on this physical card while firmware is active. It does **not** explain the earlier macOS/OpenCore BAR2 zero and `0xffffffff` reads. The next macOS boot should compare PMCSR, PCI command, direct BAR2 physical mapping, and these read-only registers before interpreting a firmware timeout. BAR0's nonzero data should not be mistaken for mwifiex register responses.
+
 Preserved interpretation:
 
-- BAR2 currently looks unlikely to be the active mwifiex register window for these offsets on this Surface/OpenCore boot path. This is not proof that BAR2 is impossible; it is only evidence from the sampled offsets and current runtime state.
+- The earlier macOS BAR2 reads did not show an active mwifiex register window at that moment. The live Ubuntu snapshot above subsequently confirms that physical BAR2 is the correct window when the card is active. The macOS discrepancy remains unresolved.
 - BAR0 is readable and returns non-trivial values, but the sampled values look high-entropy/random rather than obvious firmware-ready, driver-ready, small ring-pointer, or event-pointer values. BAR0 is therefore **not** proven to be the correct mwifiex register window.
 - Do not infer firmware readiness, firmware absence, ring state, interrupt state, safe reset semantics, or safe write semantics from these values.
 - The Linux source still says those offsets are relative to `pci_mmap1` / Linux region-resource 2. The macOS resource identity mismatch remains an open mapping question rather than a reason to write either BAR.
@@ -314,7 +330,7 @@ Recommended Surface sequence for identifying the Linux `pci_mmap1` equivalent re
 
 ## Unknowns requiring Surface/OpenCore validation
 
-- Which macOS `IOPCIDevice` BAR/resource maps Linux's `pci_mmap1` / PCI region 2 register window. Current manual reads make BAR2/resource1 unlikely for the sampled offsets and leave BAR0/resource0 unproven.
+- Why the earlier macOS `IOPCIDevice` BAR2 reads differed from Linux's proven active BAR2 window. Check direct BAR mapping, PCI PMCSR/command state, and firmware status on the next macOS boot before changing register targets.
 - Whether BAR0 high-entropy-looking values are an alias, an unrelated memory window, a firmware-side mirror, or accidental benign reads.
 - Exact values of `PCIE_HOST_INT_STATUS`, `PCIE_HOST_INT_MASK`, and `PCIE_HOST_INT_STATUS_MASK` before any interrupt enablement.
 - Whether `fw_status` is zero, `0xfedcba00`, `0xffffffff`, or another boot-helper value at cold boot and warm reboot.

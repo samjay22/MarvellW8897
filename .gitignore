@@ -11,3 +11,6 @@ xcuserdata/
 .DS_Store
 local-test/marvell_probe
 buildsettings.debug.txt
+airport-rtw88-reference/
+linux-reference/
+firmware/*.inc

@@ -34,17 +34,17 @@ void reset(MarvellW8897PciBarState& state)
     }
 
     state.resourceCount = 0;
+    state.resourceStatus = 0;
 }
 
 void release(MarvellW8897PciBarState& state)
 {
-    for (UInt32 i = 0; i < MarvellW8897Regs::kMaxResources; ++i) {
-        if (state.resources[i].map) {
-            state.resources[i].map->unmap();
-            state.resources[i].map->release();
+    for (UInt32 i = 0; i < MarvellW8897Regs::kMaxBars; ++i) {
+        if (state.bars[i].directMap) {
+            state.bars[i].directMap->unmap();
+            state.bars[i].directMap->release();
         }
     }
-
     reset(state);
 }
 
@@ -56,8 +56,8 @@ bool mapDeviceBars(IOPCIDevice* pciDevice, MarvellW8897PciBarState& state)
 
     reset(state);
 
-    // Resource maps are owned by state.resources[] until stop(). BAR entries only
-    // borrow those mappings so controller teardown remains a simple orchestration step.
+    // Read the BAR configuration before asking IOPCIFamily for its assigned
+    // memory resources. A 64-bit BAR occupies two configuration slots.
     for (UInt32 bar = 0; bar < MarvellW8897Regs::kMaxBars; ++bar) {
         MarvellW8897BarInfo& info = state.bars[bar];
         const UInt32 barRegOffset = kIOPCIConfigBaseAddress0 + (bar * sizeof(UInt32));
@@ -99,49 +99,109 @@ bool mapDeviceBars(IOPCIDevice* pciDevice, MarvellW8897PciBarState& state)
         logBarInfo(bar, info);
     }
 
+    const IOReturn resourceStatus = pciDevice->getResources();
+    state.resourceStatus = static_cast<UInt32>(resourceStatus);
+    IOLog("MarvellW8897: PCI getResources returned 0x%x\n", resourceStatus);
+
     state.resourceCount = pciDevice->getDeviceMemoryCount();
     if (state.resourceCount > MarvellW8897Regs::kMaxResources) {
         state.resourceCount = MarvellW8897Regs::kMaxResources;
     }
 
-    bool mappedAnyResource = false;
+    bool foundAnyResource = false;
     for (UInt32 resourceIndex = 0; resourceIndex < state.resourceCount; ++resourceIndex) {
-        IOMemoryMap* map = pciDevice->mapDeviceMemoryWithIndex(resourceIndex);
-        if (!map) {
-            continue;
-        }
+        IODeviceMemory* memory = pciDevice->getDeviceMemoryWithIndex(resourceIndex);
+        if (!memory) continue;
 
         MarvellW8897ResourceInfo& resource = state.resources[resourceIndex];
-        resource.map = map;
-        resource.mappedPtr = reinterpret_cast<volatile void*>(map->getVirtualAddress());
-        resource.length = map->getLength();
-        resource.physicalAddress = map->getPhysicalAddress();
+        resource.length = memory->getLength();
+        resource.physicalAddress = memory->getPhysicalAddress();
 
-        IOLog("MarvellW8897: resource%u mapped paddr=%016llx vaddr=%p len=%llu\n",
+        IOLog("MarvellW8897: resource%u paddr=%016llx len=%llu\n",
               resourceIndex,
               static_cast<unsigned long long>(resource.physicalAddress),
-              resource.mappedPtr,
               static_cast<unsigned long long>(resource.length));
 
-        mappedAnyResource = true;
+        foundAnyResource = true;
     }
 
-    if (!mappedAnyResource) {
-        IOLog("MarvellW8897: no IOKit memory resources mapped\n");
-        release(state);
-        return false;
+    if (!foundAnyResource) {
+        IOLog("MarvellW8897: no indexed IOKit memory resources found\n");
     }
 
     for (UInt32 bar = 0; bar < MarvellW8897Regs::kMaxBars; ++bar) {
         MarvellW8897BarInfo& info = state.bars[bar];
-        if (!info.present || !info.isMemory || info.isContinuation) {
-            continue;
-        }
+        if (!info.present || !info.isMemory || info.isContinuation) continue;
 
+        // Match the assigned IOKit resource by its physical base address,
+        // not its enumeration index. On this Surface BAR0 and BAR2 are both
+        // 64-bit apertures; their resource indices need not equal BAR slots.
         const UInt64 expectedBase = info.configValue & ~0xFULL;
+        bool indexedResourceMatched = false;
         for (UInt32 resourceIndex = 0; resourceIndex < state.resourceCount; ++resourceIndex) {
             MarvellW8897ResourceInfo& resource = state.resources[resourceIndex];
-            if (!resource.map || resource.claimed) {
+            if (resource.length == 0 || resource.claimed ||
+                (resource.physicalAddress & ~0xFULL) != expectedBase) {
+                continue;
+            }
+
+            indexedResourceMatched = true;
+
+            IOMemoryMap* map = pciDevice->mapDeviceMemoryWithIndex(resourceIndex);
+            if (!map || !map->getVirtualAddress() || map->getLength() == 0) {
+                if (map) { map->unmap(); map->release(); }
+                IOLog("MarvellW8897: BARslot%u resource%u could not be mapped\n",
+                      bar, resourceIndex);
+                continue;
+            }
+
+            info.directMap = map;
+            info.mappedPtr = reinterpret_cast<volatile void*>(map->getVirtualAddress());
+            info.length = map->getLength();
+            info.mappedResource = resourceIndex;
+            resource.claimed = true;
+            info.mappingStatus = "indexed-resource";
+            IOLog("MarvellW8897: BARslot%u mapped by resource%u (exact base match)\n",
+                  bar, resourceIndex);
+            break;
+        }
+
+        if (info.directMap) continue;
+
+        // The register-selected API itself identifies the aperture assigned
+        // to this BAR. Its descriptor's physical address can differ from the
+        // raw PCI configuration value after platform resource translation,
+        // so do not reject a valid descriptor for that difference.
+        const UInt8 barRegister = static_cast<UInt8>(
+            kIOPCIConfigBaseAddress0 + bar * sizeof(UInt32));
+        IODeviceMemory* registerMemory = pciDevice->getDeviceMemoryWithRegister(barRegister);
+        if (!registerMemory) {
+            info.mappingStatus = indexedResourceMatched
+                                     ? "indexed-map-failed-no-register"
+                                     : "no-register-descriptor";
+            IOLog("MarvellW8897: BARslot%u has no register descriptor\n", bar);
+            continue;
+        }
+        IOLog("MarvellW8897: BARslot%u register descriptor paddr=%016llx len=%llu\n",
+              bar,
+              static_cast<unsigned long long>(registerMemory->getPhysicalAddress()),
+              static_cast<unsigned long long>(registerMemory->getLength()));
+        info.directMap = pciDevice->mapDeviceMemoryWithRegister(barRegister);
+        if (!info.directMap || !info.directMap->getVirtualAddress() ||
+            info.directMap->getLength() == 0) {
+            if (info.directMap) { info.directMap->unmap(); info.directMap->release(); }
+            info.directMap = nullptr;
+            info.mappingStatus = "register-map-failed";
+            IOLog("MarvellW8897: BARslot%u has no direct register mapping\n", bar);
+            continue;
+        }
+        info.mappingStatus = "register-descriptor";
+        info.mappedPtr = reinterpret_cast<volatile void*>(
+            info.directMap->getVirtualAddress());
+        info.length = info.directMap->getLength();
+        for (UInt32 resourceIndex = 0; resourceIndex < state.resourceCount; ++resourceIndex) {
+            MarvellW8897ResourceInfo& resource = state.resources[resourceIndex];
+            if (resource.length == 0 || resource.claimed) {
                 continue;
             }
 
@@ -151,34 +211,10 @@ bool mapDeviceBars(IOPCIDevice* pciDevice, MarvellW8897PciBarState& state)
             }
 
             info.mappedResource = resourceIndex;
-            info.mappedPtr = resource.mappedPtr;
-            info.length = resource.length;
             resource.claimed = true;
 
-            IOLog("MarvellW8897: BARslot%u -> resource%u (exact base match)\n", bar, resourceIndex);
-            break;
-        }
-    }
-
-    for (UInt32 bar = 0; bar < MarvellW8897Regs::kMaxBars; ++bar) {
-        MarvellW8897BarInfo& info = state.bars[bar];
-        if (!info.present || !info.isMemory || info.isContinuation ||
-            info.mappedResource != MarvellW8897Regs::kInvalidResourceIndex) {
-            continue;
-        }
-
-        for (UInt32 resourceIndex = 0; resourceIndex < state.resourceCount; ++resourceIndex) {
-            MarvellW8897ResourceInfo& resource = state.resources[resourceIndex];
-            if (!resource.map || resource.claimed) {
-                continue;
-            }
-
-            info.mappedResource = resourceIndex;
-            info.mappedPtr = resource.mappedPtr;
-            info.length = resource.length;
-            resource.claimed = true;
-
-            IOLog("MarvellW8897: BARslot%u -> resource%u (fallback mapping)\n", bar, resourceIndex);
+            IOLog("MarvellW8897: BARslot%u direct map -> resource%u (exact base match)\n",
+                  bar, resourceIndex);
             break;
         }
     }
@@ -186,7 +222,7 @@ bool mapDeviceBars(IOPCIDevice* pciDevice, MarvellW8897PciBarState& state)
     bool mappedAnyBar = false;
     for (UInt32 bar = 0; bar < MarvellW8897Regs::kMaxBars; ++bar) {
         const MarvellW8897BarInfo& info = state.bars[bar];
-        if (info.mappedResource == MarvellW8897Regs::kInvalidResourceIndex) {
+        if (!info.directMap) {
             continue;
         }
 
@@ -198,8 +234,9 @@ bool mapDeviceBars(IOPCIDevice* pciDevice, MarvellW8897PciBarState& state)
     }
 
     if (!mappedAnyBar) {
-        IOLog("MarvellW8897: no BAR slot associated with mapped resources\n");
-        release(state);
+        IOLog("MarvellW8897: no PCI BAR could be mapped by register\n");
+        // Retain the raw BAR and resource metadata for the controller's
+        // I/O Registry diagnostic properties. No mapping needs releasing.
         return false;
     }
 
@@ -232,8 +269,8 @@ bool isMmioAccessValid(const MarvellW8897PciBarState& state,
         return false;
     }
 
-    if (bar.mappedResource == MarvellW8897Regs::kInvalidResourceIndex) {
-        IOLog("MarvellW8897: MMIO BAR%u has no mapped IOKit resource\n", barIndex);
+    if (!bar.directMap) {
+        IOLog("MarvellW8897: MMIO BAR%u has no direct register mapping\n", barIndex);
         return false;
     }
 
@@ -302,9 +339,7 @@ bool getBarInfoV2(const MarvellW8897PciBarState& state,
     outInfo[7] = bar.isContinuation ? 1 : 0;
     outInfo[8] = bar.mappedResource;
     outInfo[9] = bar.length;
-    outInfo[10] = (bar.mappedResource != MarvellW8897Regs::kInvalidResourceIndex)
-                      ? state.resources[bar.mappedResource].physicalAddress
-                      : 0;
+    outInfo[10] = bar.directMap ? bar.directMap->getPhysicalAddress() : 0;
     return true;
 }
 

@@ -1,0 +1,6 @@
+[submodule "MacKernelSDK"]
+	path = MacKernelSDK
+	url = https://github.com/acidanthera/MacKernelSDK.git
+[submodule "nxp-mwifiex"]
+	path = nxp-mwifiex
+	url = https://github.com/nxp-imx/mwifiex.git

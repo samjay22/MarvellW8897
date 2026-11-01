@@ -27,7 +27,15 @@ static constexpr UInt64 kDebugSelectorBitmap =
     (1ULL << 5) |
     (1ULL << 6) |
     (1ULL << 7) |
-    (1ULL << 8);
+    (1ULL << 8) |
+    (1ULL << 9) |
+    (1ULL << 10) |
+    (1ULL << 11) |
+    (1ULL << 12) |
+    (1ULL << 13) |
+    (1ULL << 14) |
+    (1ULL << 15) |
+    (1ULL << 16);
 
 } // namespace MarvellW8897Regs
 

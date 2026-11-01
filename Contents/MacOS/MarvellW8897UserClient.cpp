@@ -75,6 +75,62 @@ static const IOExternalMethodDispatch gDispatchTable[kMarvellMethodCount] = {
         0,
         MarvellW8897Regs::kBringupResultCount,
         0
+    },
+    { // uploadFirmware: exact Surface firmware, root only
+        (IOExternalMethodAction)&MarvellW8897UserClient::sUploadFirmware,
+        0,
+        kIOUCVariableStructureSize,
+        6,
+        0
+    },
+    { // register NXP MLAN software core after firmware is ready, root only
+        (IOExternalMethodAction)&MarvellW8897UserClient::sRegisterMlanCore,
+        0,
+        0,
+        0,
+        0
+    },
+    { // start MLAN firmware initialization and PCIe interrupt path, root only
+        (IOExternalMethodAction)&MarvellW8897UserClient::sStartMlanFirmware,
+        0,
+        0,
+        0,
+        0
+    },
+    { // read MLAN core status
+        (IOExternalMethodAction)&MarvellW8897UserClient::sGetMlanCoreStatus,
+        0,
+        0,
+        6,
+        0
+    },
+    { // asynchronous MLAN scan request, root only
+        (IOExternalMethodAction)&MarvellW8897UserClient::sRequestMlanScan,
+        0,
+        36,
+        0,
+        0
+    },
+    { // scan state, completion status, results state, BSS count
+        (IOExternalMethodAction)&MarvellW8897UserClient::sGetMlanScanStatus,
+        0,
+        0,
+        4,
+        0
+    },
+    { // manual open or WPA2-PSK association, root only
+        (IOExternalMethodAction)&MarvellW8897UserClient::sRequestMlanConnect,
+        0,
+        104,
+        0,
+        0
+    },
+    { // connection stage/result/associated state
+        (IOExternalMethodAction)&MarvellW8897UserClient::sGetMlanConnectStatus,
+        0,
+        0,
+        4,
+        0
     }
 };
 
@@ -266,5 +322,110 @@ IOReturn MarvellW8897UserClient::sGetBringupResult(MarvellW8897UserClient* targe
         args->scalarOutput[i] = state[i];
     }
     args->scalarOutputCount = MarvellW8897Regs::kBringupResultCount;
+    return kIOReturnSuccess;
+}
+
+IOReturn MarvellW8897UserClient::sUploadFirmware(MarvellW8897UserClient* target,
+                                                void*,
+                                                IOExternalMethodArguments* args)
+{
+    if (clientHasPrivilege(target->fTask, kIOClientPrivilegeAdministrator) != kIOReturnSuccess) {
+        return kIOReturnNotPrivileged;
+    }
+    if (!args->structureInput || args->structureInputSize != 723540) {
+        return kIOReturnBadArgument;
+    }
+
+    MarvellW8897FirmwareProtocol::Result result;
+    const IOReturn status = target->fOwner->uploadFirmware(
+        args->structureInput, args->structureInputSize, result);
+    if (status != kIOReturnSuccess) return status;
+
+    args->scalarOutput[0] = static_cast<uint64_t>(result.status);
+    args->scalarOutput[1] = result.bytesTransferred;
+    args->scalarOutput[2] = result.blockCount;
+    args->scalarOutput[3] = result.retryCount;
+    args->scalarOutput[4] = result.lastRequest;
+    args->scalarOutput[5] = result.lastFirmwareStatus;
+    args->scalarOutputCount = 6;
+    return kIOReturnSuccess;
+}
+
+IOReturn MarvellW8897UserClient::sRegisterMlanCore(MarvellW8897UserClient* target,
+                                                   void*, IOExternalMethodArguments*)
+{
+    if (clientHasPrivilege(target->fTask, kIOClientPrivilegeAdministrator) != kIOReturnSuccess)
+        return kIOReturnNotPrivileged;
+    return target->fOwner->registerMlanCore();
+}
+
+IOReturn MarvellW8897UserClient::sStartMlanFirmware(MarvellW8897UserClient* target,
+                                                    void*, IOExternalMethodArguments*)
+{
+    if (clientHasPrivilege(target->fTask, kIOClientPrivilegeAdministrator) != kIOReturnSuccess)
+        return kIOReturnNotPrivileged;
+    return target->fOwner->startMlanFirmware();
+}
+
+IOReturn MarvellW8897UserClient::sGetMlanCoreStatus(MarvellW8897UserClient* target,
+                                                    void*, IOExternalMethodArguments* args)
+{
+    uint64_t status[6] = {};
+    if (!target->fOwner->getMlanCoreStatus(status)) return kIOReturnError;
+    for (unsigned i = 0; i < 6; ++i) args->scalarOutput[i] = status[i];
+    args->scalarOutputCount = 6;
+    return kIOReturnSuccess;
+}
+
+IOReturn MarvellW8897UserClient::sRequestMlanScan(MarvellW8897UserClient* target,
+                                                  void*, IOExternalMethodArguments* args)
+{
+    if (clientHasPrivilege(target->fTask, kIOClientPrivilegeAdministrator) != kIOReturnSuccess)
+        return kIOReturnNotPrivileged;
+    if (!args->structureInput || args->structureInputSize != 36)
+        return kIOReturnBadArgument;
+    const uint8_t* input = static_cast<const uint8_t*>(args->structureInput);
+    uint32_t length = 0;
+    bcopy(input, &length, sizeof(length));
+    if (length > 32) return kIOReturnBadArgument;
+    return target->fOwner->requestMlanScan(input + 4, length);
+}
+
+IOReturn MarvellW8897UserClient::sGetMlanScanStatus(MarvellW8897UserClient* target,
+                                                    void*, IOExternalMethodArguments* args)
+{
+    uint64_t status[4] = {};
+    if (!target->fOwner->getMlanScanStatus(status)) return kIOReturnError;
+    for (unsigned i = 0; i < 4; ++i) args->scalarOutput[i] = status[i];
+    args->scalarOutputCount = 4;
+    return kIOReturnSuccess;
+}
+
+IOReturn MarvellW8897UserClient::sRequestMlanConnect(MarvellW8897UserClient* target,
+                                                     void*, IOExternalMethodArguments* args)
+{
+    if (clientHasPrivilege(target->fTask, kIOClientPrivilegeAdministrator) != kIOReturnSuccess)
+        return kIOReturnNotPrivileged;
+    if (!args->structureInput || args->structureInputSize != 104)
+        return kIOReturnBadArgument;
+    const uint8_t* input = static_cast<const uint8_t*>(args->structureInput);
+    uint32_t ssidLength = 0;
+    uint32_t passphraseLength = 0;
+    bcopy(input, &ssidLength, sizeof(ssidLength));
+    bcopy(input + 4, &passphraseLength, sizeof(passphraseLength));
+    if (ssidLength == 0 || ssidLength > 32 ||
+        (passphraseLength != 0 && (passphraseLength < 8 || passphraseLength > 63)))
+        return kIOReturnBadArgument;
+    return target->fOwner->requestMlanConnect(
+        input + 8, ssidLength, input + 40, passphraseLength);
+}
+
+IOReturn MarvellW8897UserClient::sGetMlanConnectStatus(MarvellW8897UserClient* target,
+                                                       void*, IOExternalMethodArguments* args)
+{
+    uint64_t status[4] = {};
+    if (!target->fOwner->getMlanConnectStatus(status)) return kIOReturnError;
+    for (unsigned i = 0; i < 4; ++i) args->scalarOutput[i] = status[i];
+    args->scalarOutputCount = 4;
     return kIOReturnSuccess;
 }
