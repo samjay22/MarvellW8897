@@ -100,8 +100,10 @@ struct Context {
     mlan_ds_bss connectBss;
     t_u8 connectSsid[MLAN_MAX_SSID_LENGTH];
     t_u8 connectPassphrase[MLAN_MAX_PASSPHRASE_LENGTH];
+    t_u8 connectPmk[MLAN_MAX_KEY_LENGTH];
     t_u32 connectSsidLength;
     t_u32 connectPassphraseLength;
+    t_u32 connectUsesPmk;
     t_u32 connectPhase;
     t_u32 connectPending;
     t_u32 connectRequestPhase;
@@ -129,6 +131,15 @@ namespace {
 
 bool isShuttingDown(const Context* host)
 { return __atomic_load_n(&host->shuttingDown, __ATOMIC_ACQUIRE) != 0; }
+
+void clearConnectCredential(Context* host)
+{
+    if (!host) return;
+    bzero(host->connectPassphrase, sizeof(host->connectPassphrase));
+    bzero(host->connectPmk, sizeof(host->connectPmk));
+    host->connectPassphraseLength = 0;
+    host->connectUsesPmk = 0;
+}
 
 void beginShutdown(Context* host)
 {
@@ -861,7 +872,7 @@ mlan_status completionReceivePacket(t_void* value, pmlan_buffer packet)
         packet->data_len < 14 || packet->data_len > 4096 ||
         !packetDataWithinAllocation(packet) || isShuttingDown(host))
         return MLAN_STATUS_FAILURE;
-    const bool delivered = host->controller->receiveEthernetFrame(
+    const bool delivered = host->controller->receiveDataFrame(
         packet->pbuf + packet->data_offset, packet->data_len);
     if (delivered)
         __atomic_fetch_add(&host->rxFramesDelivered, 1ULL, __ATOMIC_RELAXED);
@@ -936,6 +947,7 @@ void scanReadCallFired(thread_call_param_t value, thread_call_param_t)
 {
     auto* host = static_cast<Context*>(value);
     if (!host || isShuttingDown(host) || !host->adapter || !host->scanLock) return;
+    bool scanResultsReady = false;
     IOLockLock(host->scanLock);
     if (host->scanPhase != 2 || host->scanStatus != MLAN_STATUS_SUCCESS ||
         host->scanResultPhase != 0) {
@@ -965,8 +977,11 @@ void scanReadCallFired(thread_call_param_t value, thread_call_param_t)
         else
             host->scanStatus = static_cast<t_u32>(status);
         host->scanResultPhase = 2;
+        scanResultsReady = true;
     }
     IOLockUnlock(host->scanLock);
+    if (scanResultsReady && host->controller)
+        host->controller->mlanScanResultsReady();
     if (host->connectCall) scheduleCall(host, host->connectCall);
 }
 
@@ -992,7 +1007,7 @@ void connectTimeoutFired(thread_call_param_t value, thread_call_param_t)
         } else {
             host->connectPhase = 12;
             host->connectStatus = MLAN_STATUS_FAILURE;
-            bzero(host->connectPassphrase, sizeof(host->connectPassphrase));
+            clearConnectCredential(host);
             timedOut = true;
         }
     }
@@ -1015,7 +1030,7 @@ void finishConnectStep(Context* host, mlan_status status, t_u32 expectedPhase)
         host->connectPending = 0;
         host->connectStatus = static_cast<t_u32>(status);
         if (oldPhase == 5) {
-            bzero(host->connectPassphrase, sizeof(host->connectPassphrase));
+            clearConnectCredential(host);
             bzero(&host->connectSecurity, sizeof(host->connectSecurity));
         }
         if (status == MLAN_STATUS_SUCCESS) {
@@ -1034,7 +1049,7 @@ void finishConnectStep(Context* host, mlan_status status, t_u32 expectedPhase)
             next = true;
         } else {
             host->connectPhase = 12;
-            bzero(host->connectPassphrase, sizeof(host->connectPassphrase));
+            clearConnectCredential(host);
         }
     }
     IOLockUnlock(host->connectLock);
@@ -1065,7 +1080,7 @@ void connectCallFired(thread_call_param_t value, thread_call_param_t)
         if (scan[1] != MLAN_STATUS_SUCCESS || scan[3] == 0) {
             host->connectStatus = MLAN_STATUS_FAILURE;
             host->connectPhase = 12;
-            bzero(host->connectPassphrase, sizeof(host->connectPassphrase));
+            clearConnectCredential(host);
             IOLockUnlock(host->connectLock);
             return;
         }
@@ -1076,9 +1091,11 @@ void connectCallFired(thread_call_param_t value, thread_call_param_t)
         IOLockUnlock(host->connectLock);
         return;
     }
-    if (host->connectPhase == 5 && host->connectPassphraseLength == 0)
+    const bool hasCredential = host->connectPassphraseLength != 0 ||
+        host->connectUsesPmk != 0;
+    if (host->connectPhase == 5 && !hasCredential)
         host->connectPhase = 6;
-    if (host->connectPhase == 7 && host->connectPassphraseLength == 0)
+    if (host->connectPhase == 7 && !hasCredential)
         host->connectPhase = 8;
 
     const t_u32 phase = host->connectPhase;
@@ -1158,20 +1175,26 @@ void connectCallFired(thread_call_param_t value, thread_call_param_t)
             sec.param.auth_mode = MLAN_AUTH_MODE_OPEN;
         } else if (phase == 4) {
             sec.sub_command = MLAN_OID_SEC_CFG_ENCRYPT_MODE;
-            sec.param.encrypt_mode = host->connectPassphraseLength
+            sec.param.encrypt_mode = hasCredential
                 ? MLAN_ENCRYPTION_MODE_CCMP : MLAN_ENCRYPTION_MODE_NONE;
         } else if (phase == 5) {
             sec.sub_command = MLAN_OID_SEC_CFG_PASSPHRASE;
             auto& pass = sec.param.passphrase;
             pass.ssid.ssid_len = host->connectSsidLength;
             bcopy(host->connectSsid, pass.ssid.ssid, host->connectSsidLength);
-            pass.psk_type = MLAN_PSK_PASSPHRASE;
-            pass.psk.passphrase.passphrase_len = host->connectPassphraseLength;
-            bcopy(host->connectPassphrase, pass.psk.passphrase.passphrase,
-                  host->connectPassphraseLength);
+            if (host->connectUsesPmk) {
+                pass.psk_type = MLAN_PSK_PMK;
+                bcopy(host->connectPmk, pass.psk.pmk.pmk,
+                      sizeof(host->connectPmk));
+            } else {
+                pass.psk_type = MLAN_PSK_PASSPHRASE;
+                pass.psk.passphrase.passphrase_len = host->connectPassphraseLength;
+                bcopy(host->connectPassphrase, pass.psk.passphrase.passphrase,
+                      host->connectPassphraseLength);
+            }
         } else {
             sec.sub_command = MLAN_OID_SEC_CFG_EWPA_ENABLED;
-            sec.param.ewpa_enabled = host->connectPassphraseLength ? 1 : 0;
+            sec.param.ewpa_enabled = hasCredential ? 1 : 0;
         }
     } else {
         req.req_id = MLAN_IOCTL_BSS;
@@ -1306,7 +1329,7 @@ mlan_status completionEvent(t_void* value, pmlan_event event)
                 host->connectPhase = 11;
                 host->connectStatus = MLAN_STATUS_SUCCESS;
                 host->connectPending = 0;
-                bzero(host->connectPassphrase, sizeof(host->connectPassphrase));
+                clearConnectCredential(host);
             }
             IOLockUnlock(host->connectLock);
         }
@@ -1330,8 +1353,7 @@ mlan_status completionEvent(t_void* value, pmlan_event event)
                 } else {
                     host->connectPhase = 12;
                     host->connectStatus = MLAN_STATUS_FAILURE;
-                    bzero(host->connectPassphrase,
-                          sizeof(host->connectPassphrase));
+                    clearConnectCredential(host);
                 }
             }
             IOLockUnlock(host->connectLock);
@@ -1365,6 +1387,7 @@ mlan_status completionIoctl(t_void* value, pmlan_ioctl_req request, mlan_status 
     }
     bool readResults = false;
     bool connectAdvanced = false;
+    bool scanResultsReady = false;
     IOLockLock(host->scanLock);
     if (request == &host->scanRequest && host->scanPhase == 1) {
         host->scanStatus = static_cast<t_u32>(status);
@@ -1377,9 +1400,12 @@ mlan_status completionIoctl(t_void* value, pmlan_ioctl_req request, mlan_status 
             host->scanStatus = static_cast<t_u32>(status);
         host->scanResultPhase = 2;
         connectAdvanced = true;
+        scanResultsReady = true;
     }
     IOLockUnlock(host->scanLock);
     if (readResults && !isShuttingDown(host)) scheduleCall(host, host->scanReadCall);
+    if (scanResultsReady && !isShuttingDown(host) && host->controller)
+        host->controller->mlanScanResultsReady();
     if (!readResults && request == &host->scanRequest &&
         !isShuttingDown(host) && host->connectCall)
         scheduleCall(host, host->connectCall);
@@ -1768,7 +1794,7 @@ bool getTelemetry(Context* host, unsigned long long out[13])
     return true;
 }
 
-bool sendEthernetFrame(Context* host, mbuf_t source, unsigned length)
+bool sendDataFrame(Context* host, mbuf_t source, unsigned length)
 {
     if (!host || !host->adapter || !source || length < 14 || length > 1514 ||
         isShuttingDown(host) ||
@@ -1865,14 +1891,60 @@ bool getScanStatus(Context* host, unsigned long long out[4])
     return true;
 }
 
-unsigned requestConnect(Context* host, const unsigned char* ssid, unsigned ssidLength,
-                        const unsigned char* passphrase, unsigned passphraseLength)
+bool getScanEntry(Context* host, unsigned index, ScanEntry& entry)
+{
+    if (!host || !host->scanLock) return false;
+    bzero(&entry, sizeof(entry));
+    IOLockLock(host->scanLock);
+    constexpr t_u32 kMaxScanEntries = 200;
+    const auto& response = host->scanReadData.param.scan_resp;
+    if (host->scanPhase != 2 || host->scanResultPhase != 2 ||
+        host->scanStatus != MLAN_STATUS_SUCCESS || !response.pscan_table ||
+        host->scanCount > kMaxScanEntries || index >= host->scanCount) {
+        IOLockUnlock(host->scanLock);
+        return false;
+    }
+    const auto* entries = reinterpret_cast<const BSSDescriptor_t*>(response.pscan_table);
+    const auto& source = entries[index];
+    if (source.ssid.ssid_len > MLAN_MAX_SSID_LENGTH || source.channel == 0 ||
+        source.channel > 196) {
+        IOLockUnlock(host->scanLock);
+        return false;
+    }
+    bcopy(source.mac_address, entry.bssid, sizeof(entry.bssid));
+    entry.ssidLength = source.ssid.ssid_len;
+    bcopy(source.ssid.ssid, entry.ssid, entry.ssidLength);
+    entry.channel = source.channel;
+    // NXP stores RSSI in the scan cache using the same representation consumed
+    // by SCAN_RSSI. apple80211 reports RSSI in dBm, so retain the sign here.
+    entry.rssiDbm = -static_cast<int>(SCAN_RSSI(source.rssi));
+    entry.beaconInterval = source.beacon_period;
+    entry.privacy = source.cap_info.privacy != 0;
+    if (source.cap_info.ess) entry.capabilities |= 0x0001U;
+    if (source.cap_info.cf_pollable) entry.capabilities |= 0x0004U;
+    if (source.cap_info.cf_poll_rqst) entry.capabilities |= 0x0008U;
+    if (source.cap_info.privacy) entry.capabilities |= 0x0010U;
+    if (source.cap_info.short_preamble) entry.capabilities |= 0x0020U;
+    if (source.cap_info.pbcc) entry.capabilities |= 0x0040U;
+    if (source.cap_info.chan_agility) entry.capabilities |= 0x0080U;
+    if (source.cap_info.spectrum_mgmt) entry.capabilities |= 0x0100U;
+    if (source.cap_info.short_slot_time) entry.capabilities |= 0x0400U;
+    IOLockUnlock(host->scanLock);
+    return true;
+}
+
+unsigned requestConnectCredential(Context* host, const unsigned char* ssid,
+                                  unsigned ssidLength,
+                                  const unsigned char* credential,
+                                  unsigned credentialLength, bool credentialIsPmk)
 {
     if (!host || !host->adapter || !host->connectLock || !ssid ||
         ssidLength == 0 || ssidLength > MLAN_MAX_SSID_LENGTH ||
-        (passphraseLength != 0 &&
-         (passphraseLength < MLAN_MIN_PASSPHRASE_LENGTH ||
-          passphraseLength > MLAN_MAX_PASSPHRASE_LENGTH || !passphrase)) ||
+        (credentialIsPmk
+             ? (credentialLength != MLAN_MAX_KEY_LENGTH || !credential)
+             : (credentialLength != 0 &&
+                (credentialLength < MLAN_MIN_PASSPHRASE_LENGTH ||
+                 credentialLength > MLAN_MAX_PASSPHRASE_LENGTH || !credential))) ||
         isShuttingDown(host) ||
         __atomic_load_n(&host->initComplete, __ATOMIC_ACQUIRE) == 0 ||
         __atomic_load_n(&host->initStatus, __ATOMIC_ACQUIRE) != MLAN_STATUS_SUCCESS)
@@ -1885,12 +1957,16 @@ unsigned requestConnect(Context* host, const unsigned char* ssid, unsigned ssidL
         return 1;
     }
     bzero(host->connectSsid, sizeof(host->connectSsid));
-    bzero(host->connectPassphrase, sizeof(host->connectPassphrase));
+    clearConnectCredential(host);
     bcopy(ssid, host->connectSsid, ssidLength);
-    if (passphraseLength)
-        bcopy(passphrase, host->connectPassphrase, passphraseLength);
+    if (credentialIsPmk) {
+        bcopy(credential, host->connectPmk, sizeof(host->connectPmk));
+        host->connectUsesPmk = 1;
+    } else if (credentialLength) {
+        bcopy(credential, host->connectPassphrase, credentialLength);
+        host->connectPassphraseLength = credentialLength;
+    }
     host->connectSsidLength = ssidLength;
-    host->connectPassphraseLength = passphraseLength;
     host->connectStatus = MLAN_STATUS_PENDING;
     host->connectPhase = 1;
     host->connectPending = 0;
@@ -1903,11 +1979,25 @@ unsigned requestConnect(Context* host, const unsigned char* ssid, unsigned ssidL
         IOLockLock(host->connectLock);
         host->connectPhase = scan == 1 ? 0 : 12;
         host->connectStatus = MLAN_STATUS_FAILURE;
-        bzero(host->connectPassphrase, sizeof(host->connectPassphrase));
+        clearConnectCredential(host);
         IOLockUnlock(host->connectLock);
         return scan;
     }
     return 0;
+}
+
+unsigned requestConnect(Context* host, const unsigned char* ssid, unsigned ssidLength,
+                        const unsigned char* passphrase, unsigned passphraseLength)
+{
+    return requestConnectCredential(host, ssid, ssidLength, passphrase,
+                                    passphraseLength, false);
+}
+
+unsigned requestConnectPmk(Context* host, const unsigned char* ssid,
+                           unsigned ssidLength, const unsigned char* pmk,
+                           unsigned pmkLength)
+{
+    return requestConnectCredential(host, ssid, ssidLength, pmk, pmkLength, true);
 }
 
 bool getConnectStatus(Context* host, unsigned long long out[4])

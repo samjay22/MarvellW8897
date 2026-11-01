@@ -5,18 +5,18 @@
   <key>CFBundleIdentifier</key>
   <string>brainworks.driver.MarvellW8897</string>
   <key>CFBundleName</key>
-  <string>Marvell W8897 Controller</string>
+  <string>Marvell W8897 Wi-Fi</string>
   <key>CFBundleExecutable</key>
   <string>MarvellW8897Kext</string>
   <key>CFBundleVersion</key>
-  <string>1.0.0</string>
+  <string>1.1.0</string>
   <key>CFBundlePackageType</key>
   <string>KEXT</string>
   <key>CFBundleDevelopmentRegion</key>
   <string>en</string>
 
   <key>OSBundleCompatibleVersion</key>
-  <string>1.0.0</string>
+  <string>1.1.0</string>
   <key>OSBundleRequired</key>
   <string>Root</string>
 
@@ -28,6 +28,8 @@
     <string>2.5</string>
     <key>com.apple.iokit.IONetworkingFamily</key>
     <string>3.4</string>
+    <key>com.apple.iokit.IO80211Family</key>
+    <string>1.0.0</string>
     <key>com.apple.kpi.iokit</key>
     <string>8.0.0</string>
     <key>com.apple.kpi.libkern</key>

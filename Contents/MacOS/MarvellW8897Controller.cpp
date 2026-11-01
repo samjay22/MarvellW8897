@@ -148,8 +148,8 @@ private:
 
 } // namespace
 
-#define super IOEthernetController
-OSDefineMetaClassAndStructors(MarvellW8897Controller, IOEthernetController)
+#define super IO80211Controller
+OSDefineMetaClassAndStructors(MarvellW8897Controller, IO80211Controller)
 
 void MarvellW8897Controller::releaseMappedBars()
 {
@@ -325,6 +325,10 @@ bool MarvellW8897Controller::start(IOService* provider)
     } else {
         IOLog("MarvellW8897: could not schedule embedded firmware startup\n");
     }
+    fNativeScanDoneCall = thread_call_allocate_with_options(
+        sNativeScanDone, this, THREAD_CALL_PRIORITY_HIGH, THREAD_CALL_OPTIONS_ONCE);
+    if (!fNativeScanDoneCall)
+        IOLog("MarvellW8897: native Wi-Fi scan notifications unavailable\n");
     return true;
 }
 
@@ -332,7 +336,7 @@ void MarvellW8897Controller::stop(IOService* provider)
 {
     IOLog("MarvellW8897: stop() called\n");
 
-    IOEthernetInterface* interface = nullptr;
+    IO80211Interface* interface = nullptr;
     if (fNetworkLock) {
         IOLockLock(fNetworkLock);
         __atomic_store_n(&fStopping, true, __ATOMIC_RELEASE);
@@ -352,6 +356,12 @@ void MarvellW8897Controller::stop(IOService* provider)
         thread_call_cancel_wait(fAutoStartCall);
         thread_call_free(fAutoStartCall);
         fAutoStartCall = nullptr;
+    }
+
+    if (fNativeScanDoneCall) {
+        thread_call_cancel_wait(fNativeScanDoneCall);
+        thread_call_free(fNativeScanDoneCall);
+        fNativeScanDoneCall = nullptr;
     }
 
     if (fFirmwareLock) IOLockLock(fFirmwareLock);
@@ -808,6 +818,30 @@ IOReturn MarvellW8897Controller::requestMlanConnect(
     }
 }
 
+IOReturn MarvellW8897Controller::requestMlanConnectPmk(
+    const uint8_t* ssid, uint32_t ssidLength,
+    const uint8_t* pmk, uint32_t pmkLength)
+{
+    if (!ssid || ssidLength == 0 || ssidLength > 32 || !pmk || pmkLength != 32)
+        return kIOReturnBadArgument;
+    if (!fFirmwareLock) return kIOReturnNotReady;
+    IOLockLock(fFirmwareLock);
+    if (!fMlanContext || !fMlanInitStarted ||
+        __atomic_load_n(&fStopping, __ATOMIC_ACQUIRE)) {
+        IOLockUnlock(fFirmwareLock);
+        return kIOReturnNotReady;
+    }
+    const unsigned status = MarvellW8897MlanHost::requestConnectPmk(
+        fMlanContext, ssid, ssidLength, pmk, pmkLength);
+    IOLockUnlock(fFirmwareLock);
+    switch (status) {
+    case 0: return kIOReturnSuccess;
+    case 1: return kIOReturnBusy;
+    case 2: return kIOReturnNotReady;
+    default: return kIOReturnError;
+    }
+}
+
 bool MarvellW8897Controller::getMlanConnectStatus(uint64_t out[4])
 {
     if (!out || !fFirmwareLock) return false;
@@ -827,6 +861,7 @@ bool MarvellW8897Controller::getMlanConnectStatus(uint64_t out[4])
 void MarvellW8897Controller::mlanCoreReady(const uint8_t mac[6], bool associated)
 {
     if (!mac || !fNetworkLock) return;
+    IO80211Interface* linkInterface = nullptr;
     IOLockLock(fNetworkLock);
     if (__atomic_load_n(&fStopping, __ATOMIC_ACQUIRE)) {
         IOLockUnlock(fNetworkLock);
@@ -843,20 +878,20 @@ void MarvellW8897Controller::mlanCoreReady(const uint8_t mac[6], bool associated
         // Publish a nonzero nominal link rate until MLAN exposes the actual
         // negotiated rate. macOS uses this value for the interface bandwidth.
         IONetworkMedium* automatic = IONetworkMedium::medium(
-            kIOMediumEthernetAuto, 100000000ULL);
+            kIOMediumIEEE80211Auto, 300000000ULL);
         IONetworkInterface* attached = nullptr;
         if (!media || !automatic || !IONetworkMedium::addMedium(media, automatic) ||
             !publishMediumDictionary(media) ||
             !attachInterface(&attached, false)) {
             IOLog("MarvellW8897: could not attach network interface\n");
         } else {
-            IOEthernetInterface* ethernet = OSDynamicCast(IOEthernetInterface, attached);
-            if (ethernet) {
-                __atomic_store_n(&fNetworkInterface, ethernet, __ATOMIC_RELEASE);
+            IO80211Interface* network = OSDynamicCast(IO80211Interface, attached);
+            if (network) {
+                __atomic_store_n(&fNetworkInterface, network, __ATOMIC_RELEASE);
                 setCurrentMedium(automatic);
                 // Matching may call enable(), so publish our pointer first.
-                ethernet->registerService();
-                IOLog("MarvellW8897: Ethernet-style Wi-Fi interface attached\n");
+                network->registerService();
+                IOLog("MarvellW8897: native IO80211 interface attached\n");
             } else {
                 detachInterface(attached, false);
                 attached->release();
@@ -867,15 +902,34 @@ void MarvellW8897Controller::mlanCoreReady(const uint8_t mac[6], bool associated
         if (media) media->release();
     }
 
+    const bool linkChanged = fLinkAssociated != associated;
     fLinkAssociated = associated;
     if (fNetworkInterface) {
         const IONetworkMedium* automatic = IONetworkMedium::getMediumWithType(
-            getMediumDictionary(), kIOMediumEthernetAuto);
+            getMediumDictionary(),
+            kIOMediumIEEE80211Auto);
         setLinkStatus(kIONetworkLinkValid |
                       (associated ? kIONetworkLinkActive : 0),
                       associated ? automatic : nullptr);
+        if (linkChanged) {
+            linkInterface = fNetworkInterface;
+            linkInterface->retain();
+        }
     }
     IOLockUnlock(fNetworkLock);
+    // IO80211 clients use this message to refresh the menu-bar and System
+    // Settings state. Do not post it while the controller lock is held.
+    if (linkInterface) {
+        linkInterface->postMessage(APPLE80211_M_LINK_CHANGED);
+        linkInterface->release();
+    }
+}
+
+void MarvellW8897Controller::mlanScanResultsReady()
+{
+    if (!fNativeScanDoneCall || __atomic_load_n(&fStopping, __ATOMIC_ACQUIRE))
+        return;
+    thread_call_enter(fNativeScanDoneCall);
 }
 
 IOReturn MarvellW8897Controller::getHardwareAddress(IOEthernetAddress* address)
@@ -923,7 +977,7 @@ UInt32 MarvellW8897Controller::outputPacket(mbuf_t packet, void*)
     if (!__atomic_load_n(&fStopping, __ATOMIC_ACQUIRE) &&
         __atomic_load_n(&fNetworkEnabled, __ATOMIC_ACQUIRE) &&
         fLinkAssociated && fMlanContext) {
-        sent = MarvellW8897MlanHost::sendEthernetFrame(
+        sent = MarvellW8897MlanHost::sendDataFrame(
             fMlanContext, packet, static_cast<unsigned>(length));
     }
     IOLockUnlock(fNetworkLock);
@@ -931,7 +985,7 @@ UInt32 MarvellW8897Controller::outputPacket(mbuf_t packet, void*)
     return sent ? kIOReturnOutputSuccess : kIOReturnOutputDropped;
 }
 
-bool MarvellW8897Controller::receiveEthernetFrame(const uint8_t* bytes, uint32_t length)
+bool MarvellW8897Controller::receiveDataFrame(const uint8_t* bytes, uint32_t length)
 {
     if (!bytes || length < 14 || length > 4096 || !fNetworkLock) return false;
     if (!IOLockTryLock(fNetworkLock)) {
@@ -939,7 +993,7 @@ bool MarvellW8897Controller::receiveEthernetFrame(const uint8_t* bytes, uint32_t
         return false;
     }
     bool delivered = false;
-    IOEthernetInterface* queuedInterface = nullptr;
+    IO80211Interface* queuedInterface = nullptr;
     if (!__atomic_load_n(&fStopping, __ATOMIC_ACQUIRE) &&
         __atomic_load_n(&fNetworkEnabled, __ATOMIC_ACQUIRE) &&
         fLinkAssociated && fNetworkInterface) {
@@ -962,4 +1016,296 @@ bool MarvellW8897Controller::receiveEthernetFrame(const uint8_t* bytes, uint32_t
         queuedInterface->release();
     }
     return delivered;
+}
+
+void MarvellW8897Controller::sNativeScanDone(thread_call_param_t owner,
+                                             thread_call_param_t)
+{
+    auto* controller = static_cast<MarvellW8897Controller*>(owner);
+    if (!controller || !controller->fNetworkLock ||
+        __atomic_load_n(&controller->fStopping, __ATOMIC_ACQUIRE))
+        return;
+    IOLockLock(controller->fNetworkLock);
+    IO80211Interface* interface = controller->fNetworkInterface;
+    if (interface) interface->retain();
+    IOLockUnlock(controller->fNetworkLock);
+    if (!interface) return;
+    interface->postMessage(APPLE80211_M_SCAN_DONE);
+    interface->release();
+}
+
+namespace {
+
+UInt32 appleChannelFlags(UInt32 channel)
+{
+    return APPLE80211_C_FLAG_ACTIVE | APPLE80211_C_FLAG_20MHZ |
+        (channel <= 14 ? APPLE80211_C_FLAG_2GHZ : APPLE80211_C_FLAG_5GHZ);
+}
+
+SInt32 toAppleStatus(IOReturn status)
+{
+    return static_cast<SInt32>(status);
+}
+
+} // namespace
+
+SInt32 MarvellW8897Controller::apple80211Request(unsigned int requestType,
+                                                  int requestNumber,
+                                                  IO80211Interface* interface,
+                                                  void* data)
+{
+    if (requestType != SIOCGA80211 && requestType != SIOCSA80211)
+        return toAppleStatus(kIOReturnBadArgument);
+    if (!interface || interface != __atomic_load_n(&fNetworkInterface,
+                                                    __ATOMIC_ACQUIRE))
+        return toAppleStatus(kIOReturnNotReady);
+
+    switch (requestNumber) {
+    case APPLE80211_IOC_SCAN_REQ: {
+        if (requestType != SIOCSA80211 || !data)
+            return toAppleStatus(kIOReturnBadArgument);
+        const auto* request = static_cast<const apple80211_scan_data*>(data);
+        if (request->ssid_len > sizeof(request->ssid))
+            return toAppleStatus(kIOReturnBadArgument);
+        const IOReturn status = requestMlanScan(
+            request->ssid_len ? request->ssid : nullptr, request->ssid_len);
+        if (status == kIOReturnSuccess && fNetworkLock) {
+            IOLockLock(fNetworkLock);
+            fNativeScanIndex = 0;
+            IOLockUnlock(fNetworkLock);
+        }
+        return toAppleStatus(status);
+    }
+
+    case APPLE80211_IOC_SCAN_RESULT: {
+        if (requestType != SIOCGA80211 || !data || !fFirmwareLock || !fNetworkLock)
+            return toAppleStatus(kIOReturnBadArgument);
+        auto** output = static_cast<apple80211_scan_result**>(data);
+        UInt32 index = 0;
+        IOLockLock(fNetworkLock);
+        index = fNativeScanIndex;
+        IOLockUnlock(fNetworkLock);
+
+        MarvellW8897MlanHost::ScanEntry entry {};
+        IOLockLock(fFirmwareLock);
+        const bool available = fMlanContext &&
+            MarvellW8897MlanHost::getScanEntry(fMlanContext, index, entry);
+        IOLockUnlock(fFirmwareLock);
+        if (!available) return toAppleStatus(kIOReturnNotFound);
+
+        IOLockLock(fNetworkLock);
+        bzero(&fNativeScanResult, sizeof(fNativeScanResult));
+        fNativeScanResult.version = APPLE80211_VERSION;
+        fNativeScanResult.asr_channel.version = APPLE80211_VERSION;
+        fNativeScanResult.asr_channel.channel = entry.channel;
+        fNativeScanResult.asr_channel.flags = appleChannelFlags(entry.channel);
+        fNativeScanResult.asr_rssi = entry.rssiDbm;
+        fNativeScanResult.asr_beacon_int = static_cast<int16_t>(entry.beaconInterval);
+        fNativeScanResult.asr_cap = static_cast<int16_t>(entry.capabilities);
+        bcopy(entry.bssid, fNativeScanResult.asr_bssid,
+              sizeof(fNativeScanResult.asr_bssid));
+        fNativeScanResult.asr_ssid_len = entry.ssidLength;
+        bcopy(entry.ssid, fNativeScanResult.asr_ssid, entry.ssidLength);
+        fNativeScanResult.asr_ie_len = 0;
+        fNativeScanResult.asr_ie_data = nullptr;
+        *output = &fNativeScanResult;
+        ++fNativeScanIndex;
+        IOLockUnlock(fNetworkLock);
+        return toAppleStatus(kIOReturnSuccess);
+    }
+
+    case APPLE80211_IOC_ASSOCIATE: {
+        if (requestType != SIOCSA80211 || !data)
+            return toAppleStatus(kIOReturnBadArgument);
+        const auto* association = static_cast<const apple80211_assoc_data*>(data);
+        if (association->ad_mode != APPLE80211_AP_MODE_INFRA ||
+            association->ad_ssid_len == 0 ||
+            association->ad_ssid_len > sizeof(association->ad_ssid))
+            return toAppleStatus(kIOReturnBadArgument);
+
+        IOReturn status = kIOReturnUnsupported;
+        const bool open = association->ad_auth_upper == APPLE80211_AUTHTYPE_NONE;
+        if (open && association->ad_key.key_len == 0) {
+            status = requestMlanConnect(association->ad_ssid,
+                                        association->ad_ssid_len, nullptr, 0);
+        } else if (association->ad_key.key_len == 32) {
+            status = requestMlanConnectPmk(association->ad_ssid,
+                                           association->ad_ssid_len,
+                                           association->ad_key.key, 32);
+        }
+        if (status == kIOReturnSuccess && fNetworkLock) {
+            IOLockLock(fNetworkLock);
+            bzero(fNativeSsid, sizeof(fNativeSsid));
+            bcopy(association->ad_ssid, fNativeSsid, association->ad_ssid_len);
+            fNativeSsidLength = association->ad_ssid_len;
+            fNativeAuthLower = association->ad_auth_lower;
+            fNativeAuthUpper = association->ad_auth_upper;
+            IOLockUnlock(fNetworkLock);
+        }
+        return toAppleStatus(status);
+    }
+
+    case APPLE80211_IOC_SSID: {
+        if (requestType != SIOCGA80211 || !data || !fNetworkLock)
+            return toAppleStatus(kIOReturnBadArgument);
+        auto* ssid = static_cast<apple80211_ssid_data*>(data);
+        IOLockLock(fNetworkLock);
+        bzero(ssid, sizeof(*ssid));
+        ssid->version = APPLE80211_VERSION;
+        if (fLinkAssociated) {
+            ssid->ssid_len = fNativeSsidLength;
+            bcopy(fNativeSsid, ssid->ssid_bytes, fNativeSsidLength);
+        }
+        IOLockUnlock(fNetworkLock);
+        return toAppleStatus(kIOReturnSuccess);
+    }
+
+    case APPLE80211_IOC_AUTH_TYPE: {
+        if (!data || !fNetworkLock) return toAppleStatus(kIOReturnBadArgument);
+        auto* auth = static_cast<apple80211_authtype_data*>(data);
+        IOLockLock(fNetworkLock);
+        if (requestType == SIOCGA80211) {
+            auth->version = APPLE80211_VERSION;
+            auth->authtype_lower = fNativeAuthLower;
+            auth->authtype_upper = fNativeAuthUpper;
+        } else {
+            fNativeAuthLower = auth->authtype_lower;
+            fNativeAuthUpper = auth->authtype_upper;
+        }
+        IOLockUnlock(fNetworkLock);
+        return toAppleStatus(kIOReturnSuccess);
+    }
+
+    case APPLE80211_IOC_STATE: {
+        if (requestType != SIOCGA80211 || !data || !fNetworkLock)
+            return toAppleStatus(kIOReturnBadArgument);
+        auto* state = static_cast<apple80211_state_data*>(data);
+        IOLockLock(fNetworkLock);
+        state->version = APPLE80211_VERSION;
+        state->state = fLinkAssociated ? APPLE80211_S_RUN : APPLE80211_S_INIT;
+        IOLockUnlock(fNetworkLock);
+        return toAppleStatus(kIOReturnSuccess);
+    }
+
+    case APPLE80211_IOC_ASSOCIATE_RESULT: {
+        if (requestType != SIOCGA80211 || !data || !fNetworkLock)
+            return toAppleStatus(kIOReturnBadArgument);
+        auto* result = static_cast<apple80211_assoc_result_data*>(data);
+        IOLockLock(fNetworkLock);
+        result->version = APPLE80211_VERSION;
+        result->result = fLinkAssociated ? APPLE80211_RESULT_SUCCESS :
+            APPLE80211_RESULT_UNAVAILABLE;
+        IOLockUnlock(fNetworkLock);
+        return toAppleStatus(kIOReturnSuccess);
+    }
+
+    case APPLE80211_IOC_CARD_CAPABILITIES: {
+        if (requestType != SIOCGA80211 || !data)
+            return toAppleStatus(kIOReturnBadArgument);
+        auto* caps = static_cast<apple80211_capability_data*>(data);
+        bzero(caps, sizeof(*caps));
+        caps->version = APPLE80211_VERSION;
+        // 8897 supports 802.11n plus firmware-handled WPA/WPA2; do not claim
+        // WPA3, WEP, monitor mode, AWDL, or hosted-network support.
+        caps->capabilities[APPLE80211_CAP_WPA2 / 8] |=
+            static_cast<uint8_t>(1U << (APPLE80211_CAP_WPA2 % 8));
+        return toAppleStatus(kIOReturnSuccess);
+    }
+
+    case APPLE80211_IOC_PHY_MODE: {
+        if (requestType != SIOCGA80211 || !data)
+            return toAppleStatus(kIOReturnBadArgument);
+        auto* mode = static_cast<apple80211_phymode_data*>(data);
+        mode->version = APPLE80211_VERSION;
+        mode->phy_mode = APPLE80211_MODE_11A | APPLE80211_MODE_11B |
+            APPLE80211_MODE_11G | APPLE80211_MODE_11N;
+        mode->active_phy_mode = APPLE80211_MODE_11N;
+        return toAppleStatus(kIOReturnSuccess);
+    }
+
+    case APPLE80211_IOC_OP_MODE: {
+        if (requestType != SIOCGA80211 || !data)
+            return toAppleStatus(kIOReturnBadArgument);
+        auto* mode = static_cast<apple80211_opmode_data*>(data);
+        mode->version = APPLE80211_VERSION;
+        mode->op_mode = APPLE80211_M_STA;
+        return toAppleStatus(kIOReturnSuccess);
+    }
+
+    case APPLE80211_IOC_SUPPORTED_CHANNELS:
+    case APPLE80211_IOC_HW_SUPPORTED_CHANNELS: {
+        if (requestType != SIOCGA80211 || !data)
+            return toAppleStatus(kIOReturnBadArgument);
+        auto* channels = static_cast<apple80211_sup_channel_data*>(data);
+        static const UInt32 kChannels[] = {
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
+            36, 40, 44, 48, 149, 153, 157, 161
+        };
+        bzero(channels, sizeof(*channels));
+        channels->version = APPLE80211_VERSION;
+        channels->num_channels = sizeof(kChannels) / sizeof(kChannels[0]);
+        for (UInt32 i = 0; i < channels->num_channels; ++i) {
+            channels->supported_channels[i].version = APPLE80211_VERSION;
+            channels->supported_channels[i].channel = kChannels[i];
+            channels->supported_channels[i].flags = appleChannelFlags(kChannels[i]);
+        }
+        return toAppleStatus(kIOReturnSuccess);
+    }
+
+    case APPLE80211_IOC_POWER: {
+        if (!data) return toAppleStatus(kIOReturnBadArgument);
+        auto* power = static_cast<apple80211_power_data*>(data);
+        if (requestType == SIOCGA80211) {
+            bzero(power, sizeof(*power));
+            power->version = APPLE80211_VERSION;
+            power->num_radios = 1;
+            power->power_state[0] = APPLE80211_POWER_ON;
+        }
+        return toAppleStatus(kIOReturnSuccess);
+    }
+
+    case APPLE80211_IOC_RSN_IE:
+        // Firmware owns the embedded WPA2 supplicant and receives the
+        // corresponding PMK through APPLE80211_IOC_ASSOCIATE.
+        return toAppleStatus(kIOReturnSuccess);
+
+    default:
+        return toAppleStatus(kIOReturnUnsupported);
+    }
+}
+
+SInt32 MarvellW8897Controller::stopDMA()
+{
+    // Teardown is coordinated by stop(): it first gates outgoing packets,
+    // then disables the PCI interrupt source before releasing MLAN state.
+    return toAppleStatus(kIOReturnSuccess);
+}
+
+UInt32 MarvellW8897Controller::hardwareOutputQueueDepth(IO80211Interface*)
+{
+    // The NXP core owns the hardware descriptor queues and reports completion
+    // asynchronously; do not let IO80211 assume a separate software queue.
+    return 0;
+}
+
+SInt32 MarvellW8897Controller::performCountryCodeOperation(
+    IO80211Interface*, IO80211CountryCodeOp)
+{
+    // Country selection is firmware-managed. Reporting a fabricated region
+    // would be worse than retaining the firmware's regulatory defaults.
+    return toAppleStatus(kIOReturnSuccess);
+}
+
+SInt32 MarvellW8897Controller::enableFeature(IO80211FeatureCode code, void*)
+{
+    return code == kIO80211Feature80211n ? toAppleStatus(kIOReturnSuccess) :
+        toAppleStatus(kIOReturnUnsupported);
+}
+
+bool MarvellW8897Controller::useAppleRSNSupplicant(IO80211Interface*)
+{
+    // Association uses the 8897 firmware's WPA2 supplicant with the PMK handed
+    // over by the macOS association request. Apple should not install a second
+    // supplicant/key path for the same radio.
+    return false;
 }
