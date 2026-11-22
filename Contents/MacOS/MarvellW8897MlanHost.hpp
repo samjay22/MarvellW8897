@@ -26,9 +26,15 @@ unsigned requestScan(Context* context, const unsigned char* ssid, unsigned lengt
 bool getScanStatus(Context* context, unsigned long long out[4]);
 // Manual open or WPA2-PSK/CCMP association, using the 8897 embedded supplicant.
 // Passphrase length is 0 for open or 8-63 bytes for WPA2-PSK.
+/* hy4: 断开当前关联，使后续 --connect 能立即切换到新网络。 */
+unsigned requestDisconnect(Context* context);
 unsigned requestConnect(Context* context, const unsigned char* ssid, unsigned ssidLength,
                         const unsigned char* passphrase, unsigned passphraseLength);
 bool getConnectStatus(Context* context, unsigned long long out[4]);
+/* sp4-broadcast: 让固件接收所有组播帧（MLAN_OID_BSS_MULTICAST_LIST /
+ * MLAN_ALL_MULTI_MODE）。macOS 的 setMulticastList() 回调会调用它。
+ * 返回 0 = 已下发或已完成，1 = 正在下发，2 = 固件未就绪，3 = 失败。 */
+unsigned requestMulticastAll(Context* context);
 
 } // namespace MarvellW8897MlanHost
 #endif

@@ -78,6 +78,7 @@ public:
     bool getMlanCoreStatus(uint64_t out[6]);
     IOReturn requestMlanScan(const uint8_t* ssid, uint32_t length);
     bool getMlanScanStatus(uint64_t out[4]);
+    IOReturn requestMlanDisconnect();
     IOReturn requestMlanConnect(const uint8_t* ssid, uint32_t ssidLength,
                                 const uint8_t* passphrase, uint32_t passphraseLength);
     bool getMlanConnectStatus(uint64_t out[4]);
@@ -86,6 +87,10 @@ public:
     void mlanCoreReady(const uint8_t mac[6], bool associated);
     bool receiveEthernetFrame(const uint8_t* bytes, uint32_t length);
     IOReturn getHardwareAddress(IOEthernetAddress* address) APPLE_KEXT_OVERRIDE;
+    /* sp4-broadcast: 让 macOS 的组播成员关系真正下发到 Marvell 固件。 */
+    IOReturn setMulticastMode(bool active) APPLE_KEXT_OVERRIDE;
+    IOReturn setMulticastList(IOEthernetAddress* addrs, UInt32 count) APPLE_KEXT_OVERRIDE;
+    IOReturn setPromiscuousMode(bool active) APPLE_KEXT_OVERRIDE;
     IOReturn enable(IONetworkInterface* interface) APPLE_KEXT_OVERRIDE;
     IOReturn disable(IONetworkInterface* interface) APPLE_KEXT_OVERRIDE;
     UInt32 outputPacket(mbuf_t packet, void* param) APPLE_KEXT_OVERRIDE;

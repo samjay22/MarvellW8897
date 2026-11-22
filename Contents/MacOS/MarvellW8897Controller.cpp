@@ -25,8 +25,8 @@
 namespace {
 
 constexpr uint32_t kRegisterBar = 2;
-constexpr UInt32 kMaxAutoStartAttempts = 3;
-constexpr UInt32 kAutoRetryDelayMs = 10000;
+constexpr UInt32 kMaxAutoStartAttempts = 5;
+constexpr UInt32 kAutoRetryDelayMs = 3000;
 static_assert(sizeof(MarvellW8897FirmwareImage::kSha256) == SHA256_DIGEST_LENGTH,
               "firmware hash size must match SHA-256");
 
@@ -317,7 +317,15 @@ bool MarvellW8897Controller::start(IOService* provider)
     fAutoStartCall = thread_call_allocate(sAutoStart, this);
     if (fAutoStartCall) {
         uint64_t deadline = 0;
-        clock_interval_to_deadline(5000, kMillisecondScale, &deadline);
+        /* 交接补丁：MLAN 自启延迟可配置（boot-arg w8897-mlan-delay=<秒>，默认 5s）。
+         * 用途：在"窗口被服务"的前提下把 MLAN init 推迟到桌面时刻（见实验方案）。 */
+        UInt32 mlanDelayMs = 5000;
+        {
+            UInt32 s = 0;
+            if (PE_parse_boot_argn("w8897-mlan-delay", &s, sizeof(s)) && s >= 1 && s <= 600)
+                mlanDelayMs = s * 1000;
+        }
+        clock_interval_to_deadline(mlanDelayMs, kMillisecondScale, &deadline);
         thread_call_enter_delayed(fAutoStartCall, deadline);
         IOLog("MarvellW8897: embedded firmware startup scheduled\n");
     } else {
@@ -526,21 +534,26 @@ IOReturn MarvellW8897Controller::uploadFirmware(
     SHA256_Update(&context, image, imageSize);
     SHA256_Final(digest, &context);
     if (memcmp(digest, MarvellW8897FirmwareImage::kSha256, sizeof(digest)) != 0) {
+        setProperty("MarvellFwUploadGate", "sha-mismatch");
         return kIOReturnBadArgument;
     }
+    setProperty("MarvellFwUploadGate", "sha-ok");
 
-    if (!fFirmwareLock) return kIOReturnNotReady;
+    if (!fFirmwareLock) { setProperty("MarvellFwUploadGate", "no-lock"); return kIOReturnNotReady; }
     IOLockLock(fFirmwareLock);
     if (!fPCIDevice || fFirmwareTransferFailed || fMlanInitStarted) {
+        setProperty("MarvellFwUploadGate", !fPCIDevice ? "no-device" : (fFirmwareTransferFailed ? "xfer-failed" : "init-started"));
         IOLockUnlock(fFirmwareLock);
         return kIOReturnNotReady;
     }
 
     PcieFirmwareDevice device(fPCIDevice, fPciBarState);
     if (!device.valid()) {
+        setProperty("MarvellFwUploadGate", "device-invalid");
         IOLockUnlock(fFirmwareLock);
         return kIOReturnNoMemory;
     }
+    setProperty("MarvellFwDeviceValid", 1, 32);
 
     fPCIDevice->setBusMasterEnable(true);
     result = MarvellW8897FirmwareProtocol::upload(
@@ -553,7 +566,8 @@ IOReturn MarvellW8897Controller::uploadFirmware(
         // They may reflect a device that wakes after the initial boot probe.
         const bool retryableNoTransfer = result.blockCount == 0 &&
             (result.status == MarvellW8897FirmwareProtocol::Status::NotDownloadOwner ||
-             result.status == MarvellW8897FirmwareProtocol::Status::HelperTimeout);
+             result.status == MarvellW8897FirmwareProtocol::Status::HelperTimeout ||
+             result.status == MarvellW8897FirmwareProtocol::Status::RegisterAccessFailed);
         if (!retryableNoTransfer)
             fFirmwareTransferFailed = true;
     } else {
@@ -563,6 +577,10 @@ IOReturn MarvellW8897Controller::uploadFirmware(
         fBringupResult.failureReason = MarvellW8897BringupFailureReason::None;
         fBringupResult.firmwareStatusValue = result.lastFirmwareStatus;
     }
+    setProperty("MarvellFwUploadStatus", MarvellW8897FirmwareProtocol::statusName(result.status));
+    setProperty("MarvellFwUploadBytes", (unsigned long long)result.bytesTransferred, 64);
+    setProperty("MarvellFwUploadBlocks", result.blockCount, 32);
+    setProperty("MarvellFwLastFwStatus", (unsigned long long)result.lastFirmwareStatus, 32);
     IOLog("MarvellW8897: firmware upload status=%s bytes=%llu blocks=%u retries=%u fwStatus=%08x\n",
           MarvellW8897FirmwareProtocol::statusName(result.status),
           static_cast<unsigned long long>(result.bytesTransferred),
@@ -578,6 +596,7 @@ IOReturn MarvellW8897Controller::registerMlanCore()
     if (!fFirmwareLock) return kIOReturnNotReady;
     IOLockLock(fFirmwareLock);
     if (!fPCIDevice || fFirmwareTransferFailed || !fTransportState.firmwareReady) {
+        setProperty("MarvellMlanRegisterGate", !fPCIDevice ? "no-device" : (fFirmwareTransferFailed ? "xfer-failed" : "fw-not-ready"));
         IOLockUnlock(fFirmwareLock);
         return kIOReturnNotReady;
     }
@@ -587,6 +606,7 @@ IOReturn MarvellW8897Controller::registerMlanCore()
     }
     fMlanContext = MarvellW8897MlanHost::registerCore(this);
     const bool registered = fMlanContext != nullptr;
+    setProperty("MarvellMlanRegisterCoreOk", registered ? 1 : 0, 32);
     IOLockUnlock(fFirmwareLock);
     return registered ? kIOReturnSuccess : kIOReturnError;
 }
@@ -598,6 +618,7 @@ void MarvellW8897Controller::sAutoStart(thread_call_param_t owner,
     if (!controller || __atomic_load_n(&controller->fStopping, __ATOMIC_ACQUIRE)) return;
 
     ++controller->fAutoStartAttempts;
+    controller->setProperty("MarvellAutoStartAttempt", controller->fAutoStartAttempts, 32);
     logPciPowerState(controller->fPCIDevice, "auto-start");
 
     MarvellW8897FirmwareProtocol::Result result {};
@@ -612,7 +633,10 @@ void MarvellW8897Controller::sAutoStart(thread_call_param_t owner,
         const bool retryableNoTransfer = status == kIOReturnSuccess &&
             result.blockCount == 0 &&
             (result.status == MarvellW8897FirmwareProtocol::Status::NotDownloadOwner ||
-             result.status == MarvellW8897FirmwareProtocol::Status::HelperTimeout);
+             result.status == MarvellW8897FirmwareProtocol::Status::HelperTimeout ||
+             /* 本机实测：固件跳转后 ~1s 寄存器窗口读全 1（瞬态），恢复即 READY。
+              * Sequoia 上从未出现所以上游判为终态；Monterey 上必须重试。 */
+             result.status == MarvellW8897FirmwareProtocol::Status::RegisterAccessFailed);
         if (retryableNoTransfer &&
             controller->fAutoStartAttempts < kMaxAutoStartAttempts &&
             !__atomic_load_n(&controller->fStopping, __ATOMIC_ACQUIRE) &&
@@ -627,7 +651,10 @@ void MarvellW8897Controller::sAutoStart(thread_call_param_t owner,
     }
 
     status = controller->registerMlanCore();
+    controller->setProperty("MarvellMlanRegisterIOReturn", (unsigned long long)status, 32);
     if (status == kIOReturnSuccess) status = controller->startMlanFirmware();
+    controller->setProperty("MarvellMlanStartIOReturn", (unsigned long long)status, 32);
+    controller->setProperty("MarvellMlanInitStarted", controller->fMlanInitStarted ? 1 : 0, 32);
     IOLog("MarvellW8897: automatic MLAN startup result=0x%x\n", status);
 }
 
@@ -670,6 +697,7 @@ IOReturn MarvellW8897Controller::startMlanFirmware()
     }
 
     int interruptType = 0;
+    setProperty("MarvellMlanInterruptSrcOk", 1, 32);
     if (fPCIDevice->getInterruptType(0, &interruptType) != kIOReturnSuccess) {
         fMlanWorkLoop->removeEventSource(fMlanInterrupt);
         fMlanInterrupt->release();
@@ -680,7 +708,9 @@ IOReturn MarvellW8897Controller::startMlanFirmware()
         return kIOReturnError;
     }
     const bool msi = (interruptType & kIOInterruptTypePCIMessaged) != 0;
+    setProperty("MarvellMlanInterruptMsi", msi ? 1 : 0, 32);
     const unsigned status = MarvellW8897MlanHost::startFirmware(fMlanContext, msi);
+    setProperty("MarvellMlanStartFirmwareStatus", (unsigned long long)status, 32);
     if (status != 0U && status != 1U) {
         fPCIDevice->setBusMasterEnable(false);
         fFirmwareTransferFailed = true;
@@ -757,6 +787,20 @@ bool MarvellW8897Controller::getMlanScanStatus(uint64_t out[4])
     for (unsigned i = 0; i < 4; ++i) out[i] = status[i];
     IOLockUnlock(fFirmwareLock);
     return ok;
+}
+
+IOReturn MarvellW8897Controller::requestMlanDisconnect()
+{
+    if (!fFirmwareLock) return kIOReturnNotReady;
+    IOLockLock(fFirmwareLock);
+    if (!fMlanContext || !fMlanInitStarted ||
+        __atomic_load_n(&fStopping, __ATOMIC_ACQUIRE)) {
+        IOLockUnlock(fFirmwareLock);
+        return kIOReturnNotReady;
+    }
+    const unsigned status = MarvellW8897MlanHost::requestDisconnect(fMlanContext);
+    IOLockUnlock(fFirmwareLock);
+    return status == 0 ? kIOReturnSuccess : (status == 2 ? kIOReturnNotReady : kIOReturnError);
 }
 
 IOReturn MarvellW8897Controller::requestMlanConnect(
@@ -853,6 +897,9 @@ void MarvellW8897Controller::mlanCoreReady(const uint8_t mac[6], bool associated
                       associated ? automatic : nullptr);
     }
     IOLockUnlock(fNetworkLock);
+    // sp4-broadcast: 关联完成后再确保固件处于 ALL_MULTI（若之前尚未就绪）。
+    if (associated && fMlanContext)
+        (void)MarvellW8897MlanHost::requestMulticastAll(fMlanContext);
 }
 
 IOReturn MarvellW8897Controller::getHardwareAddress(IOEthernetAddress* address)
@@ -870,6 +917,36 @@ IOReturn MarvellW8897Controller::enable(IONetworkInterface* interface)
         __atomic_load_n(&fStopping, __ATOMIC_ACQUIRE) || !fMlanContext)
         return kIOReturnNotReady;
     __atomic_store_n(&fNetworkEnabled, true, __ATOMIC_RELEASE);
+    // sp4-broadcast: 网卡启用后尽早让固件接收组播（mDNS / SSDP 发现依赖它）。
+    (void)MarvellW8897MlanHost::requestMulticastAll(fMlanContext);
+    return kIOReturnSuccess;
+}
+
+/* sp4-broadcast: 下面三个覆盖把 macOS 的组播/杂收请求翻译成 Marvell 固件
+ * 的 MLAN_OID_BSS_MULTICAST_LIST 命令。原驱动未覆盖，基类实现为空，
+ * 导致加入 239.255.255.250 / 224.0.0.251 后硬件仍丢弃所有组播帧。 */
+IOReturn MarvellW8897Controller::setMulticastMode(bool active)
+{
+    if (!fMlanContext) return kIOReturnNoDevice;
+    if (!active) return kIOReturnSuccess;   // 关闭时保留 ALL_MULTI，避免反复下发
+    return MarvellW8897MlanHost::requestMulticastAll(fMlanContext) == 0
+        ? kIOReturnSuccess : kIOReturnError;
+}
+
+IOReturn MarvellW8897Controller::setMulticastList(IOEthernetAddress* addrs, UInt32 count)
+{
+    (void)addrs;
+    (void)count;   // ALL_MULTI 模式不需要精确地址列表
+    if (!fMlanContext) return kIOReturnNoDevice;
+    return MarvellW8897MlanHost::requestMulticastAll(fMlanContext) == 0
+        ? kIOReturnSuccess : kIOReturnError;
+}
+
+IOReturn MarvellW8897Controller::setPromiscuousMode(bool active)
+{
+    // 固件不支持完整的混杂模式；安全返回成功，避免基类默认路径再次触发崩溃。
+    IOLog("MarvellW8897: promiscuous mode %s ignored (ALL_MULTI already enabled)\n",
+          active ? "on" : "off");
     return kIOReturnSuccess;
 }
 
