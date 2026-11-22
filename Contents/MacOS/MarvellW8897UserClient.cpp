@@ -131,6 +131,13 @@ static const IOExternalMethodDispatch gDispatchTable[kMarvellMethodCount] = {
         0,
         4,
         0
+    },
+    { // hy4: disconnect current association
+        (IOExternalMethodAction)&MarvellW8897UserClient::sRequestMlanDisconnect,
+        0,
+        0,
+        0,
+        0
     }
 };
 
@@ -418,6 +425,13 @@ IOReturn MarvellW8897UserClient::sRequestMlanConnect(MarvellW8897UserClient* tar
         return kIOReturnBadArgument;
     return target->fOwner->requestMlanConnect(
         input + 8, ssidLength, input + 40, passphraseLength);
+}
+
+IOReturn MarvellW8897UserClient::sRequestMlanDisconnect(MarvellW8897UserClient* target,
+                                                        void*, IOExternalMethodArguments*)
+{
+    if (!target || !target->fOwner) return kIOReturnError;
+    return target->fOwner->requestMlanDisconnect();
 }
 
 IOReturn MarvellW8897UserClient::sGetMlanConnectStatus(MarvellW8897UserClient* target,

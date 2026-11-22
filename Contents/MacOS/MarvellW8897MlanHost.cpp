@@ -21,6 +21,9 @@
 #define DEBUG_LEVEL1 1
 extern "C" {
 #include "mlan.h"
+#include "mlan_ioctl.h"
+#include "mlan_fw.h"
+#include "mlan_ieee.h"
 }
 
 namespace MarvellW8897MlanHost {
@@ -60,6 +63,7 @@ struct Context {
     IOLock* scanLock;
     mlan_ioctl_req scanRequest;
     mlan_ds_scan scanData;
+    t_u8* scanUserBuffer;   // hy4: USER_CONFIG 扫描的大缓冲 (mlan_ds_scan + wlan_user_scan_cfg)
     mlan_ioctl_req scanReadRequest;
     mlan_ds_scan scanReadData;
     t_u32 scanPhase;
@@ -81,6 +85,13 @@ struct Context {
     t_u32 connectStatus;
     bool connectPrefer5Attempted;
     bool connectPrefer5Disabled;
+    /* sp4-broadcast: 固件组播过滤器状态。请求对象必须是常驻内存，
+     * 因为 MLAN 在 PENDING 时持有指针直到 completionIoctl 回调。 */
+    IOLock* multicastLock;
+    mlan_ioctl_req multicastRequest;
+    mlan_ds_bss multicastBss;
+    t_u32 multicastPhase;      // 0 idle, 1 pending, 2 completed, 3 failed
+    t_u32 multicastConfigured; // 固件接受 ALL_MULTI 后置 1
 };
 
 struct DmaMapping {
@@ -107,9 +118,83 @@ void beginShutdown(Context* host)
 struct Allocation {
     size_t total;
     uint64_t magic;
+    bool fromPool;              // hy4: true = 来自原子池，free 时归还而非 IOFree
+    Allocation* poolNext;       // hy4: 原子池自由链表指针
 };
 constexpr uint64_t kAllocationMagic = 0x4d4c414e38383937ULL;
 constexpr t_u32 kDmaFromDevice = 2;
+
+/* --------------------------------------------------------------------------
+ * hy4 修复：MLAN 的 TX 聚合路径 (wlan_11n_aggregate_pkt) 在持有
+ * ra_list_spinlock 自旋锁时调用 moal_malloc(..., MLAN_MEM_FLAG_ATOMIC)。
+ * 原实现忽略该 flag，直接 IOMalloc() —— 锁上下文里可能阻塞，导致
+ * "thread_invoke: preemption_level 1" 内核 panic（浏览网页时必现）。
+ * 修复：启动时预分配固定大小缓冲池，ATOMIC 分配从池中无锁取块。
+ * 8897 tx_buf_size=4K，池块数据区 8K 足够；256 块共约 2MB。
+ * -------------------------------------------------------------------------- */
+struct AtomicPool {
+    Allocation* head { nullptr };
+    unsigned allocated { 0 };
+};
+static AtomicPool gAtomicPool;
+constexpr size_t kAtomicPoolDataSize = 8192;
+constexpr unsigned kAtomicPoolCount = 256;
+
+static void atomicPoolDrain();   // forward decl (atomicPoolInit 失败时回滚)
+
+static bool atomicPoolInit()
+{
+    for (unsigned i = 0; i < kAtomicPoolCount; ++i) {
+        const size_t total = sizeof(Allocation) + kAtomicPoolDataSize;
+        auto* h = static_cast<Allocation*>(IOMalloc(total));
+        if (!h) { atomicPoolDrain(); return false; }
+        h->total = total;
+        h->magic = kAllocationMagic;
+        h->fromPool = true;
+        // lock-free push onto global stack
+        Allocation* old = __atomic_load_n(&gAtomicPool.head, __ATOMIC_ACQUIRE);
+        do {
+            h->poolNext = old;
+        } while (!__atomic_compare_exchange_n(&gAtomicPool.head, &old, h,
+                    false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE));
+        ++gAtomicPool.allocated;
+    }
+    return true;
+}
+
+static void atomicPoolDrain()
+{
+    Allocation* h = __atomic_exchange_n(&gAtomicPool.head, nullptr, __ATOMIC_ACQ_REL);
+    while (h) {
+        Allocation* next = h->poolNext;
+        IOFree(h, h->total);
+        h = next;
+    }
+    gAtomicPool.allocated = 0;
+}
+
+static Allocation* atomicPoolPop()
+{
+    Allocation* old = __atomic_load_n(&gAtomicPool.head, __ATOMIC_ACQUIRE);
+    while (old) {
+        Allocation* next = old->poolNext;
+        if (__atomic_compare_exchange_n(&gAtomicPool.head, &old, next,
+                false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+            return old;
+    }
+    return nullptr;
+}
+
+static void atomicPoolPush(Allocation* h)
+{
+    h->magic = kAllocationMagic;
+    h->fromPool = true;
+    Allocation* old = __atomic_load_n(&gAtomicPool.head, __ATOMIC_ACQUIRE);
+    do {
+        h->poolNext = old;
+    } while (!__atomic_compare_exchange_n(&gAtomicPool.head, &old, h,
+                false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE));
+}
 
 void* allocate(size_t size)
 {
@@ -119,6 +204,8 @@ void* allocate(size_t size)
     if (!header) return nullptr;
     header->total = total;
     header->magic = kAllocationMagic;
+    header->fromPool = false;
+    header->poolNext = nullptr;
     void* data = header + 1;
     bzero(data, size);
     return data;
@@ -130,6 +217,10 @@ void deallocate(void* data)
     auto* header = static_cast<Allocation*>(data) - 1;
     if (header->magic != kAllocationMagic) {
         IOLog("MarvellW8897: MLAN invalid allocation header\n");
+        return;
+    }
+    if (header->fromPool) {
+        atomicPoolPush(header);   // hy4: 归还原子池，不 IOFree
         return;
     }
     const size_t total = header->total;
@@ -158,9 +249,33 @@ bool packetDataWithinAllocation(const mlan_buffer* packet)
            packet->data_len <= available - packet->data_offset;
 }
 
-mlan_status mallocCallback(t_void*, t_u32 size, t_u32, t_u8** out)
+mlan_status mallocCallback(t_void*, t_u32 size, t_u32 flags, t_u8** out)
 {
     if (!out) return MLAN_STATUS_FAILURE;
+    /* hy4: MLAN 在自旋锁上下文请求 MLAN_MEM_FLAG_ATOMIC 时，必须从预分配池
+     * 无阻塞取块；绝不能调用可能阻塞的 IOMalloc()。 */
+    if (flags & MLAN_MEM_FLAG_ATOMIC) {
+        Allocation* h = atomicPoolPop();
+        if (h) {
+            if (h->total < sizeof(Allocation) + size) {
+                // 理论不会发生（池块 8K >= 4K tx + header）
+                atomicPoolPush(h);
+                *out = nullptr;
+                return MLAN_STATUS_FAILURE;
+            }
+            h->magic = kAllocationMagic;
+            h->fromPool = true;
+            void* data = h + 1;
+            bzero(data, size);   // 纯内存操作，锁上下文中安全
+            *out = static_cast<t_u8*>(data);
+            return MLAN_STATUS_SUCCESS;
+        }
+        /* hy4: 池耗尽时绝不降级到 IOMalloc —— 那正是 panic 的根因。
+         * MLAN 的 TX 聚合路径能处理 moal_malloc 失败（丢包/返回失败），
+         * 宁可丢一个聚合包，也不能在自旋锁里阻塞把整机打挂。 */
+        *out = nullptr;
+        return MLAN_STATUS_FAILURE;
+    }
     *out = static_cast<t_u8*>(allocate(size));
     return *out ? MLAN_STATUS_SUCCESS : MLAN_STATUS_FAILURE;
 }
@@ -714,6 +829,41 @@ void networkCallFired(thread_call_param_t value, thread_call_param_t)
     host->controller->mlanCoreReady(
         host->mac, __atomic_load_n(&host->associated, __ATOMIC_ACQUIRE) != 0);
 }
+/* hy4: 把扫描结果发布到 IORegistry，供用户态工具/菜单栏 App 读取（避免改 UserClient ABI）。
+ * blob 格式：u32 count; 每条 = u32 ssidLen + u8 ssid[32] + u8 bssid[6] + u16 channel + u16 rssiRaw
+ */
+static void publishScanBlob(Context* host)
+{
+    if (!host || !host->controller) return;
+    const auto& response = host->scanReadData.param.scan_resp;
+    const t_u32 count = host->scanCount;
+    if (!response.pscan_table || count == 0 || count > MRVDRV_MAX_BSSID_LIST) return;
+
+    struct Entry { t_u32 ssidLen; t_u8 ssid[MLAN_MAX_SSID_LENGTH]; t_u8 bssid[MLAN_MAC_ADDR_LENGTH]; t_u16 channel; t_u16 rssi; };
+    const size_t total = sizeof(t_u32) + count * sizeof(Entry);
+    auto* buf = static_cast<t_u8*>(IOMalloc(total));
+    if (!buf) return;
+    memcpy(buf, &count, sizeof(count));
+    auto* out = reinterpret_cast<Entry*>(buf + sizeof(count));
+    const auto* entries = reinterpret_cast<const BSSDescriptor_t*>(response.pscan_table);
+    for (t_u32 i = 0; i < count; ++i) {
+        out[i].ssidLen = entries[i].ssid.ssid_len;
+        memset(out[i].ssid, 0, sizeof(out[i].ssid));
+        t_u32 ssl = entries[i].ssid.ssid_len;
+        if (ssl > sizeof(out[i].ssid)) ssl = sizeof(out[i].ssid);
+        memcpy(out[i].ssid, entries[i].ssid.ssid, ssl);
+        memcpy(out[i].bssid, entries[i].mac_address, sizeof(out[i].bssid));
+        out[i].channel = entries[i].channel;
+        out[i].rssi = entries[i].rssi;
+    }
+    OSData* data = OSData::withBytes(buf, total);
+    IOFree(buf, total);
+    if (data) {
+        host->controller->setProperty("MarvellScanBlob", data);
+        data->release();
+    }
+}
+
 void scanReadCallFired(thread_call_param_t value, thread_call_param_t)
 {
     auto* host = static_cast<Context*>(value);
@@ -742,9 +892,10 @@ void scanReadCallFired(thread_call_param_t value, thread_call_param_t)
     }
     IOLockLock(host->scanLock);
     if (host->scanResultPhase == 1) {
-        if (status == MLAN_STATUS_SUCCESS)
+        if (status == MLAN_STATUS_SUCCESS) {
             host->scanCount = host->scanReadData.param.scan_resp.num_in_scan_table;
-        else
+            publishScanBlob(host);   // hy4: 发布扫描表给用户态
+        } else
             host->scanStatus = static_cast<t_u32>(status);
         host->scanResultPhase = 2;
     }
@@ -1089,6 +1240,18 @@ mlan_status completionIoctl(t_void* value, pmlan_ioctl_req request, mlan_status 
 {
     auto* host = static_cast<Context*>(value);
     if (!host || !request || !host->scanLock) return MLAN_STATUS_FAILURE;
+    /* sp4-broadcast: 组播命令完成回调 */
+    if (request == &host->multicastRequest && host->multicastLock) {
+        IOLockLock(host->multicastLock);
+        host->multicastPhase = status == MLAN_STATUS_SUCCESS ? 2 : 3;
+        IOLockUnlock(host->multicastLock);
+        if (status == MLAN_STATUS_SUCCESS)
+            __atomic_store_n(&host->multicastConfigured, 1U, __ATOMIC_RELEASE);
+        else
+            IOLog("MarvellW8897: multicast filter ioctl failed, status=%u\n",
+                  static_cast<unsigned>(status));
+        return MLAN_STATUS_SUCCESS;
+    }
     if (request == &host->infoRequest) {
         IOLockLock(host->infoLock);
         if (host->infoPhase == 1)
@@ -1185,17 +1348,37 @@ Context* registerCore(MarvellW8897Controller* controller)
     auto* host = static_cast<Context*>(IOMalloc(sizeof(Context)));
     if (!host) return nullptr;
     bzero(host, sizeof(*host));
+    /* hy4: 5G 扫描需要 wlan_user_scan_cfg (1525B)，独立大缓冲 */
+    host->scanUserBuffer = static_cast<t_u8*>(
+        IOMalloc(sizeof(mlan_ds_scan) + sizeof(wlan_user_scan_cfg)));
+    if (!host->scanUserBuffer) { IOFree(host, sizeof(*host)); return nullptr; }
     host->controller = controller;
     host->mappingLock = IOLockAlloc();
     host->infoLock = IOLockAlloc();
     host->scanLock = IOLockAlloc();
     host->connectLock = IOLockAlloc();
-    if (!host->mappingLock || !host->infoLock || !host->scanLock || !host->connectLock) {
+    host->multicastLock = IOLockAlloc();   // sp4-broadcast
+    if (!host->mappingLock || !host->infoLock || !host->scanLock ||
+        !host->connectLock || !host->multicastLock) {
+        if (host->multicastLock) IOLockFree(host->multicastLock);
         if (host->connectLock) IOLockFree(host->connectLock);
         if (host->scanLock) IOLockFree(host->scanLock);
         if (host->infoLock) IOLockFree(host->infoLock);
         if (host->mappingLock) IOLockFree(host->mappingLock);
+        if (host->scanUserBuffer) { IOFree(host->scanUserBuffer, sizeof(mlan_ds_scan) + sizeof(wlan_user_scan_cfg)); host->scanUserBuffer = nullptr; }
         IOFree(host, sizeof(*host));
+        return nullptr;
+    }
+    /* hy4: 初始化 TX 原子分配池（必须在 MLAN 注册、任何 TX 活动之前）。 */
+    if (!atomicPoolInit()) {
+        IOLockFree(host->multicastLock);   // sp4-broadcast
+        IOLockFree(host->connectLock);
+        IOLockFree(host->scanLock);
+        IOLockFree(host->infoLock);
+        IOLockFree(host->mappingLock);
+        if (host->scanUserBuffer) { IOFree(host->scanUserBuffer, sizeof(mlan_ds_scan) + sizeof(wlan_user_scan_cfg)); host->scanUserBuffer = nullptr; }
+        IOFree(host, sizeof(*host));
+        IOLog("MarvellW8897: hy4 atomic pool init failed\n");
         return nullptr;
     }
     host->mainCall = thread_call_allocate(mainCallFired, host);
@@ -1218,10 +1401,12 @@ Context* registerCore(MarvellW8897Controller* controller)
         if (host->scanReadCall) thread_call_free(host->scanReadCall);
         if (host->connectCall) thread_call_free(host->connectCall);
         if (host->connectTimeoutCall) thread_call_free(host->connectTimeoutCall);
+        IOLockFree(host->multicastLock);   // sp4-broadcast
         IOLockFree(host->connectLock);
         IOLockFree(host->scanLock);
         IOLockFree(host->infoLock);
         IOLockFree(host->mappingLock);
+        if (host->scanUserBuffer) { IOFree(host->scanUserBuffer, sizeof(mlan_ds_scan) + sizeof(wlan_user_scan_cfg)); host->scanUserBuffer = nullptr; }
         IOFree(host, sizeof(*host));
         return nullptr;
     }
@@ -1334,6 +1519,7 @@ Context* registerCore(MarvellW8897Controller* controller)
         IOLockFree(host->infoLock);
         IOLockFree(host->scanLock);
         IOLockFree(host->connectLock);
+        if (host->scanUserBuffer) { IOFree(host->scanUserBuffer, sizeof(mlan_ds_scan) + sizeof(wlan_user_scan_cfg)); host->scanUserBuffer = nullptr; }
         IOFree(host, sizeof(*host));
         return nullptr;
     }
@@ -1354,6 +1540,8 @@ void unregisterCore(Context* host)
     thread_call_cancel_wait(host->connectCall);
     thread_call_cancel_wait(host->connectTimeoutCall);
     if (host->adapter) mlan_unregister(host->adapter);
+    /* hy4: MLAN 注销后所有缓冲已经 moal_mfree 归还池，此时安全释放整池。 */
+    atomicPoolDrain();
     thread_call_free(host->mainCall);
     thread_call_free(host->rxCall);
     thread_call_free(host->txCall);
@@ -1372,6 +1560,8 @@ void unregisterCore(Context* host)
     IOLockFree(host->infoLock);
     IOLockFree(host->scanLock);
     IOLockFree(host->connectLock);
+    IOLockFree(host->multicastLock);   // sp4-broadcast
+    if (host->scanUserBuffer) { IOFree(host->scanUserBuffer, sizeof(mlan_ds_scan) + sizeof(wlan_user_scan_cfg)); host->scanUserBuffer = nullptr; }
     IOFree(host, sizeof(*host));
 }
 
@@ -1473,20 +1663,67 @@ unsigned requestScan(Context* host, const unsigned char* ssid, unsigned length)
     host->scanStatus = MLAN_STATUS_PENDING;
     host->scanCount = 0;
     bzero(&host->scanRequest, sizeof(host->scanRequest));
-    bzero(&host->scanData, sizeof(host->scanData));
-    host->scanData.sub_command = length ? MLAN_OID_SCAN_SPECIFIC_SSID : MLAN_OID_SCAN_NORMAL;
-    if (length) {
-        host->scanData.param.scan_req.scan_ssid.ssid_len = length;
-        bcopy(ssid, host->scanData.param.scan_req.scan_ssid.ssid, length);
+
+    /* hy4: 用 USER_CONFIG 显式列出 2.4G + 5G 信道（修复 5G 扫不到的问题）。
+     * 大缓冲独立分配，避免写越 scanData(72B)。失败时不影响原有扫描逻辑。 */
+    bool useUserConfig = false;
+    if (host->scanUserBuffer) {
+        const size_t total = sizeof(mlan_ds_scan) + sizeof(wlan_user_scan_cfg);
+        bzero(host->scanUserBuffer, total);
+        auto* ds = reinterpret_cast<mlan_ds_scan*>(host->scanUserBuffer);
+        ds->sub_command = MLAN_OID_SCAN_USER_CONFIG;
+        ds->param.user_scan.scan_cfg_len = sizeof(wlan_user_scan_cfg);
+        auto* cfg = reinterpret_cast<wlan_user_scan_cfg*>(ds->param.user_scan.scan_cfg_buf);
+        cfg->bss_mode = MLAN_SCAN_MODE_BSS;
+        cfg->num_probes = 1;
+        // radio_type: 0=B/G(2.4G), 1=A(5G); scan_type: 1=active
+        static const struct { t_u8 ch; t_u8 band; } kChans[] = {
+            {1,0},{6,0},{11,0},{36,1},{40,1},{44,1},{48,1},
+            {149,1},{153,1},{157,1},{161,1},{165,1}
+        };
+        unsigned n = 0;
+        for (const auto& c : kChans) {
+            if (n >= WLAN_USER_SCAN_CHAN_MAX) break;
+            cfg->chan_list[n].chan_number = c.ch;
+            cfg->chan_list[n].radio_type = c.band;
+            cfg->chan_list[n].scan_type = MLAN_SCAN_TYPE_ACTIVE;
+            cfg->chan_list[n].scan_time = 0;
+            ++n;
+        }
+        host->scanRequest.pbuf = host->scanUserBuffer;
+        host->scanRequest.buf_len = total;
+        useUserConfig = true;
+    }
+    if (!useUserConfig) {
+        bzero(&host->scanData, sizeof(host->scanData));
+        host->scanData.sub_command = length ? MLAN_OID_SCAN_SPECIFIC_SSID : MLAN_OID_SCAN_NORMAL;
+        if (length) {
+            host->scanData.param.scan_req.scan_ssid.ssid_len = length;
+            bcopy(ssid, host->scanData.param.scan_req.scan_ssid.ssid, length);
+        }
+        host->scanRequest.pbuf = reinterpret_cast<t_u8*>(&host->scanData);
+        host->scanRequest.buf_len = sizeof(host->scanData);
     }
     host->scanRequest.bss_index = 0;
     host->scanRequest.req_id = MLAN_IOCTL_SCAN;
     host->scanRequest.action = MLAN_ACT_SET;
-    host->scanRequest.pbuf = reinterpret_cast<t_u8*>(&host->scanData);
-    host->scanRequest.buf_len = sizeof(host->scanData);
     IOLockUnlock(host->scanLock);
 
-    const mlan_status status = mlan_ioctl(host->adapter, &host->scanRequest);
+    mlan_status status = mlan_ioctl(host->adapter, &host->scanRequest);
+    /* hy4: USER_CONFIG 若被固件拒绝，回退到 NORMAL 扫描，保证 2.4G 不断。 */
+    if (useUserConfig && status != MLAN_STATUS_SUCCESS && status != MLAN_STATUS_PENDING) {
+        IOLockLock(host->scanLock);
+        bzero(&host->scanData, sizeof(host->scanData));
+        host->scanData.sub_command = length ? MLAN_OID_SCAN_SPECIFIC_SSID : MLAN_OID_SCAN_NORMAL;
+        if (length) {
+            host->scanData.param.scan_req.scan_ssid.ssid_len = length;
+            bcopy(ssid, host->scanData.param.scan_req.scan_ssid.ssid, length);
+        }
+        host->scanRequest.pbuf = reinterpret_cast<t_u8*>(&host->scanData);
+        host->scanRequest.buf_len = sizeof(host->scanData);
+        IOLockUnlock(host->scanLock);
+        status = mlan_ioctl(host->adapter, &host->scanRequest);
+    }
     if (status == MLAN_STATUS_PENDING) {
         thread_call_enter(host->mainCall);
         return 0;
@@ -1513,6 +1750,81 @@ bool getScanStatus(Context* host, unsigned long long out[4])
     out[3] = host->scanCount;
     IOLockUnlock(host->scanLock);
     return true;
+}
+
+/* hy4: 断开当前关联。FW_DISCONNECTED 事件会把 associated 清零，这里等待其生效。 */
+unsigned requestDisconnect(Context* host)
+{
+    if (!host || !host->adapter || isShuttingDown(host) ||
+        __atomic_load_n(&host->initComplete, __ATOMIC_ACQUIRE) == 0)
+        return 2;
+    if (!__atomic_load_n(&host->associated, __ATOMIC_ACQUIRE))
+        return 0;   // 本来就没连
+
+    mlan_ioctl_req req{};
+    mlan_ds_bss bss{};
+    bss.sub_command = MLAN_OID_BSS_STOP;
+    req.bss_index = 0;
+    req.req_id = MLAN_IOCTL_BSS;
+    req.action = MLAN_ACT_SET;
+    req.pbuf = reinterpret_cast<t_u8*>(&bss);
+    req.buf_len = sizeof(bss);
+    (void)mlan_ioctl(host->adapter, &req);   // PENDING 也 OK：完成回调按指针比对，不会误用本地对象
+
+    for (unsigned i = 0; i < 200 &&
+         __atomic_load_n(&host->associated, __ATOMIC_ACQUIRE); ++i)
+        IOSleep(25);   // 最多 5s，等 FW_DISCONNECTED 事件
+
+    IOLockLock(host->connectLock);
+    host->connectPhase = 0;
+    host->connectStatus = 0;
+    IOLockUnlock(host->connectLock);
+    return __atomic_load_n(&host->associated, __ATOMIC_ACQUIRE) ? 3 : 0;
+}
+
+/* sp4-broadcast: 通过 MLAN_OID_BSS_MULTICAST_LIST 让固件进入 ALL_MULTI
+ * 接收模式。macOS 只在驱动响应 kIOPacketFilterMulticast 时调用
+ * setMulticastList()；原驱动没有覆盖它，组播帧因此在固件层被丢弃。 */
+unsigned requestMulticastAll(Context* host)
+{
+    if (!host || !host->adapter || !host->multicastLock ||
+        isShuttingDown(host) ||
+        __atomic_load_n(&host->initComplete, __ATOMIC_ACQUIRE) == 0 ||
+        __atomic_load_n(&host->initStatus, __ATOMIC_ACQUIRE) != MLAN_STATUS_SUCCESS)
+        return 2;
+    if (__atomic_load_n(&host->multicastConfigured, __ATOMIC_ACQUIRE))
+        return 0;                       // 已生效，无需重复下发
+
+    IOLockLock(host->multicastLock);
+    if (host->multicastPhase == 1) {    // 上一条命令还在固件里
+        IOLockUnlock(host->multicastLock);
+        return 1;
+    }
+    bzero(&host->multicastBss, sizeof(host->multicastBss));
+    host->multicastBss.sub_command = MLAN_OID_BSS_MULTICAST_LIST;
+    host->multicastBss.param.multicast_list.mode = MLAN_ALL_MULTI_MODE;
+    host->multicastBss.param.multicast_list.num_multicast_addr = 0;
+    host->multicastRequest.req_id = MLAN_IOCTL_BSS;
+    host->multicastRequest.action = MLAN_ACT_SET;
+    host->multicastRequest.pbuf = reinterpret_cast<t_u8*>(&host->multicastBss);
+    host->multicastRequest.buf_len = sizeof(host->multicastBss);
+    host->multicastPhase = 1;
+    IOLockUnlock(host->multicastLock);
+
+    const mlan_status status = mlan_ioctl(host->adapter, &host->multicastRequest);
+    if (status == MLAN_STATUS_PENDING) {
+        thread_call_enter(host->mainCall);   // 驱动完成队列
+        return 0;
+    }
+    IOLockLock(host->multicastLock);
+    host->multicastPhase = status == MLAN_STATUS_SUCCESS ? 2 : 3;
+    IOLockUnlock(host->multicastLock);
+    if (status == MLAN_STATUS_SUCCESS)
+        __atomic_store_n(&host->multicastConfigured, 1U, __ATOMIC_RELEASE);
+    else
+        IOLog("MarvellW8897: multicast filter ioctl failed, status=%u\n",
+              static_cast<unsigned>(status));
+    return status == MLAN_STATUS_SUCCESS ? 0 : 3;
 }
 
 unsigned requestConnect(Context* host, const unsigned char* ssid, unsigned ssidLength,
